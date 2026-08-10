@@ -147,11 +147,15 @@ models/
 *.onnx
 
 # Data files
-data/
+data/*
 *.csv
 *.json
 *.xlsx
 *.xls
+# Exceptions: the bundled offline fallback sample CSV and its doc ARE source
+# (negations must come AFTER the broad data/*.csv rules — last match wins)
+!data/xauusd_sample.csv
+!data/README.md
 
 # Logs
 logs/
