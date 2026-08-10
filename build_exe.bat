@@ -12,17 +12,50 @@ echo   AI-XAUUSD Trading System - Windows EXE Builder
 echo ============================================================
 echo.
 
-rem ---- 0. Check Python ------------------------------------------------------
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python was not found.
-    echo Please install Python 3.9 - 3.11 from https://www.python.org/downloads/
-    echo and make sure to tick "Add Python to PATH" during installation.
+rem ---- 0. Locate a compatible Python (3.9 - 3.11) --------------------------
+rem  The pinned scientific stack (numpy 1.24 / pandas 2.1 / torch 2.1) has no
+rem  wheels for Python 3.12/3.13, so we actively search for a compatible one.
+set "PY="
+
+rem  Prefer the Windows "py" launcher to pick an exact version
+for %%V in (3.11 3.10 3.9) do (
+  if not defined PY (
+    py -%%V -c "import sys" >nul 2>&1
+    if not errorlevel 1 set "PY=py -%%V"
+  )
+)
+
+rem  Fall back to plain "python" if it is already in range
+if not defined PY (
+  set "PYVER="
+  for /f "tokens=2" %%v in ('python --version 2^>^&1') do set "PYVER=%%v"
+  if defined PYVER (
+    for /f "tokens=1,2 delims=." %%a in ("!PYVER!") do (
+      if "%%a"=="3" if %%b GEQ 9 if %%b LEQ 11 set "PY=python"
+      if "%%a"=="3" set "SYSVER=3.%%b"
+    )
+  )
+)
+
+if not defined PY (
+    echo [ERROR] No compatible Python found.
+    echo This project requires Python 3.9 - 3.11 ^(pinned numpy/pandas/torch
+    echo have no prebuilt wheels for newer versions^).
+    if defined SYSVER echo Your default python.exe is Python %SYSVER%.
+    echo.
+    echo Fix: install Python 3.11 ^(64-bit^) - e.g.
+    echo   https://www.python.org/downloads/release/python-3119/
+    echo During setup tick "Add python.exe to PATH" and keep the "py launcher".
+    echo Then re-run this script. Python 3.13 can stay installed side by side -
+    echo this script will automatically pick the correct interpreter.
+    echo.
+    echo Note: warnings like "Ignoring invalid distribution ~umpy" are harmless
+    echo leftovers from an interrupted pip install. To clean them, delete the
+    echo folders starting with ~ inside your site-packages directory.
     pause
     exit /b 1
 )
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo [INFO] Python %PYVER%
+for /f "tokens=*" %%v in ('%PY% --version 2^>^&1') do echo [INFO] Using %%v ^(%PY%^)
 
 rem ---- 1. Choose build mode -------------------------------------------------
 echo.
@@ -38,20 +71,20 @@ if "%MODE%"=="" set MODE=2
 rem ---- 2. Install dependencies ----------------------------------------------
 echo.
 echo [1/3] Installing dependencies (already-installed packages are skipped)...
-python -m pip install --upgrade pip --quiet
+%PY% -m pip install --upgrade pip --quiet
 if errorlevel 1 goto :pipfail
 
 if "%MODE%"=="1" (
     echo      Installing CPU-only torch ^(smaller, no GPU needed^)...
-    python -m pip install --quiet torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
-    python -m pip install --quiet -r requirements.txt
+    %PY% -m pip install --quiet torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+    %PY% -m pip install --quiet -r requirements.txt
 ) else (
     echo      Light mode: skipping torch / stable-baselines3
-    python -m pip install --quiet numpy==1.24.3 pandas==2.1.4 gymnasium==0.29.1 matplotlib==3.8.2 yfinance==0.2.18 python-dotenv==1.0.0
+    %PY% -m pip install --quiet numpy==1.24.3 pandas==2.1.4 gymnasium==0.29.1 matplotlib==3.8.2 yfinance==0.2.18 python-dotenv==1.0.0
 )
 if errorlevel 1 goto :pipfail
 
-python -m pip install --quiet "pyinstaller>=6.0"
+%PY% -m pip install --quiet "pyinstaller>=6.0"
 if errorlevel 1 goto :pipfail
 
 rem ---- 3. Build -------------------------------------------------------------
@@ -60,7 +93,7 @@ echo [2/3] Running PyInstaller (do not close this window)...
 if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 
-python -m PyInstaller ai_xauusd_trading.spec --clean --noconfirm
+%PY% -m PyInstaller ai_xauusd_trading.spec --clean --noconfirm
 if errorlevel 1 (
     echo.
     echo [ERROR] Build failed. Please copy the red error text above when asking for help.
