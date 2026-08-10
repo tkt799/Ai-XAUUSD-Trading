@@ -111,8 +111,41 @@ if errorlevel 1 goto :pipfail
 rem ---- 3. Build -------------------------------------------------------------
 echo.
 echo [2/3] Running PyInstaller (do not close this window)...
-if exist dist rmdir /s /q dist
-if exist build rmdir /s /q build
+
+rem  A still-RUNNING copy of the old exe locks dist\AiXauusdTrading.exe and
+rem  makes the final step fail with "WinError 5: Access is denied" (a plain
+rem  "rmdir" silently leaves the locked file behind). Kill it first.
+taskkill /F /IM AiXauusdTrading.exe >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+rem  Remove old build artifacts, with a few retries in case an antivirus scan
+rem  or an Explorer window is temporarily holding a lock on the folder.
+set TRY=0
+rmdir /s /q dist >nul 2>&1
+rmdir /s /q build >nul 2>&1
+:cleanup_retry
+if exist dist\AiXauusdTrading.exe (
+    set /a TRY+=1
+    if !TRY! LSS 4 (
+        timeout /t 3 /nobreak >nul
+        rmdir /s /q dist >nul 2>&1
+        goto :cleanup_retry
+    )
+    echo.
+    echo [ERROR] The old file could not be deleted:
+    echo   %CD%\dist\AiXauusdTrading.exe
+    echo Something is still holding it ^(a running copy, an Explorer window in
+    echo that folder, or an antivirus scan^).
+    echo.
+    echo Fix:
+    echo   1. Close every AiXauusdTrading window ^(check the taskbar^)
+    echo   2. Open cmd and run:  taskkill /F /IM AiXauusdTrading.exe
+    echo   3. Delete this folder by hand:  %CD%\dist
+    echo   4. Re-run this script
+    echo.
+    pause
+    exit /b 1
+)
 
 %PY% -m PyInstaller ai_xauusd_trading.spec --clean --noconfirm
 if errorlevel 1 (
