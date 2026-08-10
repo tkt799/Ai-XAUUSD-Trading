@@ -7,10 +7,12 @@
 
 ## 📊 Performance Highlights
 
-- **🎯 58.3% Win Rate** (26% improvement over baseline)
-- **💰 11x Better Average Wins** ($4.16 → $49.45)
-- **⚖️ Risk-Reward Ratio: 1:0.47** (2.8x improvement)
-- **🎯 45 USD Daily Profit Target - ACHIEVED**
+> ⚠️ **指标复核中（2026-08）**：深度代码审查发现此前版本的 `trading_env.py` 存在盈亏结算 bug（止损退出被错误记为 $0），下列数据基于该缺陷环境产生，**不能作为真实预期**。环境已在新版本修复，指标将在重新训练与回测后刷新。详见仓库中的 `PYTHON_REVIEW_REPORT.md`。
+
+- **🎯 58.3% Win Rate** (26% improvement over baseline) *(待复测)*
+- **💰 11x Better Average Wins** ($4.16 → $49.45) *(待复测)*
+- **⚖️ Risk-Reward Ratio: 1:0.47** (2.8x improvement) *(待复测)*
+- **🎯 45 USD Daily Profit Target - ACHIEVED** *(待复测)*
 - **🧠 Market Regime-Adaptive Parameters**
 
 ## 🚀 Key Features
@@ -73,6 +75,17 @@ pip install -r requirements.txt
 python download_models.py
 ```
 
+### Fetch Training Data (训练/回测前置步骤)
+```bash
+python data_fetch.py    # 从 Yahoo Finance 下载 GC=F 日线 → xauusd_data.csv
+```
+
+### Run Tests
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
 ## 🚀 Quick Start
 
 ### Run Backtesting Demo
@@ -87,15 +100,14 @@ run_advanced_trading_demo()
 ```python
 from live_ensemble_trading import LiveEnsembleTrader
 
-# Initialize live trader
+# Initialize live trader (ensemble defaults to ./ensemble_models/)
 trader = LiveEnsembleTrader(
     capital=1000,
     leverage=50,
-    ensemble_path="models/ensemble_v1"
 )
 
-# Start live trading
-trader.start_live_trading()
+# Start live trading loop (+Ctrl-C to stop and print the summary)
+trader.run_live_trading()
 ```
 
 ### Market Regime Analysis
@@ -113,25 +125,36 @@ print(f"Optimal parameters: {params}")
 
 ## 🏗️ System Architecture
 
+实际代码结构（扁平模块布局）：
+
 ```
 AI-XAUUSD-Trading/
-├── 🤖 Core AI Engine
-│   ├── ensemble_trader.py          # PPO/TD3/SAC ensemble
-│   ├── trading_env.py              # Gym environment
-│   └── curriculum_training.py      # Advanced training
-├── 🎯 Market Intelligence
-│   ├── market_regime_detector.py   # Regime classification
-│   └── regime_adaptive_trading.py  # Adaptive strategies
-├── 💰 Risk Management
-│   ├── advanced_risk_manager.py    # Position sizing & exits
-│   └── live_trading_interface.py   # Live execution
-├── 📊 Analytics
-│   ├── performance_analyzer.py     # Trade analysis
-│   └── visualization.py            # Charts & reports
-└── 🔧 Utilities
-    ├── data_fetcher.py            # Market data
-    ├── model_manager.py           # Model handling
-    └── config_manager.py          # Configuration
+├── 🤖 核心 AI 引擎
+│   ├── trading_env.py              # Gymnasium 交易环境（含共享特征管线
+│   │                               #   add_technical_indicators / build_observation）
+│   ├── optimal_timing_env.py       # 出入场时机环境（纯 pandas 指标，无前视偏差）
+│   ├── transformer_policy.py       # Transformer 特征提取策略（15 维观测）
+│   ├── ensemble_trader.py          # PPO/TD3/SAC 集成交易器
+│   └── curriculum_training.py      # 课程式训练
+├── 🎯 市场智能
+│   ├── market_regime_detector.py   # 6 种市场状态识别 + 自适应参数
+│   └── regime_adaptive_trading_demo.py
+├── 🔴 实盘与回测
+│   ├── live_ensemble_trading.py    # 实盘交易循环 (run_live_trading)
+│   ├── ensemble_backtest.py        # 集成回测
+│   ├── backtest.py / forward_test.py / test_env.py
+│   └── train_model.py / data_fetch.py / download_models.py
+├── 📊 分析与演示
+│   ├── quick_demo.py               # 零重依赖快速演示（无需 torch/SB3）
+│   ├── advanced_trading_demo.py / confidence_sizing_demo.py
+│   └── trading_performance_analysis.py / real_results_demo.py
+├── 🧪 工程化
+│   ├── tests/test_smoke.py         # 回归测试（编码了审查发现的全部 bug 场景）
+│   ├── .github/workflows/ci-cd.yml # CI/CD
+│   └── setup.py / pyproject.toml   # 打包（py-modules 扁平布局）
+└── 📦 发布
+    ├── upload_to_hf.py             # 上传 Hugging Face Hub
+    └── arxiv_submit.py / prepare_arxiv_submission.py
 ```
 
 ## 📊 Performance Analysis
@@ -203,20 +226,18 @@ from live_ensemble_trading import LiveEnsembleTrader
 trader = LiveEnsembleTrader(
     capital=1000,
     leverage=50,
-    risk_per_trade=0.02,  # 2% risk per trade
-    max_daily_loss=0.05    # 5% max daily loss
 )
 
-# Start automated trading
-trader.start_live_trading()
+# Start automated trading (Ctrl-C to stop; prints a performance summary)
+trader.run_live_trading()
 ```
 
-### Monitoring Dashboard
+### Monitoring
 ```python
-# Real-time performance monitoring
-trader.get_performance_summary()
-trader.plot_daily_pnl()
-trader.check_risk_limits()
+# Performance summary over recorded trades
+trader.print_performance_summary()
+
+# Trade log is also written to ensemble_trading.log
 ```
 
 ## 📚 API Reference
@@ -226,9 +247,11 @@ trader.check_risk_limits()
 #### `EnsembleTrader`
 ```python
 class EnsembleTrader:
-    def __init__(self, model_paths: List[str])
-    def predict(self, state: np.ndarray) -> Tuple[float, float]
-    def get_confidence(self, state: np.ndarray) -> float
+    def __init__(self, models_config: dict = None)
+    def train_ensemble(self, train_df, save_path='./ensemble_models/') -> None
+    def load_ensemble(self, load_path='./ensemble_models/') -> None
+    # Returns (action, confidence); method: 'weighted_vote' | 'average' | 'majority'
+    def predict_ensemble(self, observation, method='weighted_vote') -> Tuple[float, float]
 ```
 
 #### `MarketRegimeDetector`
@@ -241,9 +264,10 @@ class MarketRegimeDetector:
 #### `LiveEnsembleTrader`
 ```python
 class LiveEnsembleTrader:
-    def execute_trade(self, signal: float, confidence: float) -> bool
-    def get_portfolio_status(self) -> Dict
-    def emergency_stop(self) -> None
+    def __init__(self, ensemble_path='./ensemble_models/', capital=100, leverage=50)
+    def run_live_trading(self, symbol='GC=F', interval_minutes=5) -> None
+    def execute_trade(self, action, confidence, current_price) -> None
+    def print_performance_summary(self) -> None
 ```
 
 ## 🤝 Contributing

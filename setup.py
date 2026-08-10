@@ -5,7 +5,7 @@ A comprehensive reinforcement learning trading system for XAUUSD (Gold vs US Dol
 featuring ensemble AI models, market regime detection, and advanced risk management.
 """
 
-from setuptools import setup, find_packages
+from setuptools import setup
 import os
 
 # Read the contents of README file
@@ -16,7 +16,24 @@ with open(os.path.join(this_directory, 'README.md'), encoding='utf-8') as f:
 # Read requirements
 def read_requirements(filename):
     with open(filename, 'r') as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        return [line.strip() for line in f
+                if line.strip() and not line.startswith('#')]
+
+# Flat layout — there is no package directory, so list the reusable
+# top-level modules explicitly (find_packages() would find nothing).
+PY_MODULES = [
+    "trading_env",
+    "optimal_timing_env",
+    "market_regime_detector",
+    "ensemble_trader",
+    "transformer_policy",
+    "live_ensemble_trading",
+    "curriculum_training",
+    "ensemble_backtest",
+    "data_fetch",
+    "capital_calculator",
+    "download_models",
+]
 
 setup(
     name="ai-xauusd-trading",
@@ -27,7 +44,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/JonusNattapong/AI-XAUUSD-Trading",
-    packages=find_packages(),
+    py_modules=PY_MODULES,
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Financial and Insurance Industry",
@@ -63,19 +80,13 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            # All targets verified to exist in their modules
             "ai-trading-demo=advanced_trading_demo:run_advanced_trading_demo",
-            "ai-live-trading=live_ensemble_trading:start_live_trading",
-            "ai-regime-analysis=market_regime_detector:analyze_current_regime",
+            "ai-quick-demo=quick_demo:main",
+            "ai-live-trading=live_ensemble_trading:main",
         ],
     },
     include_package_data=True,
-    package_data={
-        "ai_xauusd_trading": [
-            "models/*",
-            "config/*",
-            "data/*",
-        ],
-    },
     keywords=[
         "trading",
         "reinforcement-learning",

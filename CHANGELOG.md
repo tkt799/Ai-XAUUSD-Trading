@@ -5,6 +5,31 @@ All notable changes to the AI-XAUUSD Trading System will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-08
+
+### 🔧 关键修复版本（源自全量代码审查，详见 `PYTHON_REVIEW_REPORT.md`）
+
+#### 🚨 Fixed — 致命运行时缺陷
+- **TradingEnv 无法实例化**：删除 `_calculate_indicators()` 中错误合并进来的 `__init__` 尾部副本（`current_step` AttributeError + 无限递归）
+- **盈亏记账错乱**：止损/移动止损/超时退出曾被记为 $0（环境"永不亏损"）；新增 `_close_position()` 先结算后清状态
+- **分级止盈失效**：每个止盈档位现在只触发一次；部分平仓正确保留剩余仓位
+- **数据末尾未平仓**：回合结束强制平仓并结算
+
+#### 🏗️ Changed — 架构与依赖
+- 全部环境迁移 Gymnasium API（与 stable-baselines3 2.x 兼容）；观测统一 `float32`
+- `optimal_timing_env.py`：移除"用未来 10 根K线计算奖励"的前视偏差；指标改用纯 pandas 实现，**移除 TA-Lib 依赖**；观测空间尺寸与实际输出一致（120 维）；盈亏按名义本金×杠杆正确量级
+- `transformer_policy.py`：按真实 15 维观测重写特征切分（原按 27 维假设会维度不匹配崩溃）
+- 新增共享特征管线 `trading_env.add_technical_indicators()` / `build_observation()`；实盘与集成回测的观测已对齐训练环境
+- `requirements.txt`：移除从未使用的 `ta`、`pandas-ta`；新增 `requirements-dev.txt`
+
+#### 🧪 Added — 测试与工程化
+- `tests/test_smoke.py`：12 个回归测试，覆盖本次审查发现的全部关键场景（12/12 通过）
+- CI/CD 重写：适配扁平布局、安装 CPU 版 torch 加速、flake8 致命错误门禁、pytest 覆盖率、PyPI/Docs 改为手动触发、Docker 镜像改推 GHCR
+- `setup.py` / `pyproject.toml`：`py-modules` 显式声明（此前打包结果为空）；控制台入口修正为真实存在的函数
+
+#### 📚 Docs
+- README：真实文件结构图、实盘 API 示例修正（`run_live_trading`）、性能指标标注"待复测"、补充 `data_fetch.py` 前置步骤与测试说明
+
 ## [1.0.0] - 2024-12-XX
 
 ### 🎉 Major Release: Maximum Profitability Framework

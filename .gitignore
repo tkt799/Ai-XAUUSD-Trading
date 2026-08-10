@@ -159,9 +159,15 @@ performance_log.txt
 
 # Results and outputs
 results/
+output/
 outputs/
 plots/
 charts/
+
+# PyInstaller one-click build artifacts (build_exe.bat / build_exe.sh)
+AiXauusdTrading.exe
+*.exe
+*.spec.bak
 
 # API keys and secrets
 api_keys.txt

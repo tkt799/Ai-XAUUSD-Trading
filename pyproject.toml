@@ -97,12 +97,21 @@ ai-regime-analysis = "ai_xauusd_trading.analysis:analyze_market_regime"
 zip-safe = false
 include-package-data = true
 
-[tool.setuptools.packages.find]
-where = ["."]
-exclude = ["tests*", "docs*", "notebooks*"]
-
-[tool.setuptools.package-data]
-"ai_xauusd_trading" = ["models/*", "config/*", "data/*"]
+# Flat layout: ship the reusable top-level modules explicitly
+# (auto-discovery finds nothing here — there is no package directory).
+py-modules = [
+    "trading_env",
+    "optimal_timing_env",
+    "market_regime_detector",
+    "ensemble_trader",
+    "transformer_policy",
+    "live_ensemble_trading",
+    "curriculum_training",
+    "ensemble_backtest",
+    "data_fetch",
+    "capital_calculator",
+    "download_models",
+]
 
 [tool.black]
 line-length = 88
@@ -165,7 +174,15 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["ai_xauusd_trading"]
+# Flat layout — measure the core modules (no ai_xauusd_trading package exists)
+source = [
+    "trading_env",
+    "optimal_timing_env",
+    "market_regime_detector",
+    "ensemble_trader",
+    "transformer_policy",
+    "quick_demo",
+]
 omit = [
     "*/tests/*",
     "*/test_*.py",
