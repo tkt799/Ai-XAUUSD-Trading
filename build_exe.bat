@@ -101,7 +101,7 @@ if "%MODE%"=="1" (
     %PY% -m pip install --quiet -r requirements.txt
 ) else (
     echo      Light mode: skipping torch / stable-baselines3
-    %PY% -m pip install --quiet numpy==1.24.3 pandas==2.1.4 gymnasium==0.29.1 matplotlib==3.8.2 yfinance==0.2.18 python-dotenv==1.0.0
+    %PY% -m pip install --quiet numpy==1.24.3 pandas==2.1.4 gymnasium==0.29.1 matplotlib==3.8.2 "yfinance>=1.4.0" python-dotenv==1.0.0
 )
 if errorlevel 1 goto :pipfail
 

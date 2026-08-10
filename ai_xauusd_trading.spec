@@ -29,6 +29,12 @@ datas = []
 binaries = []
 hiddenimports = []
 
+# Bundled resource files shipped inside the exe
+# (offline fallback dataset used by run_all.py stage 3)
+import os
+if os.path.exists(os.path.join("data", "xauusd_sample.csv")):
+    datas += [("data", "data")]
+
 # App modules (flat layout — PyInstaller's main analysis starts at run_all.py
 # and only finds directly imported modules, so list the rest explicitly)
 hiddenimports += [

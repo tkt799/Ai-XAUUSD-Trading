@@ -239,6 +239,7 @@ def stage_quick_demo(ctx):
 # --------------------------------------------------------------------------- #
 @run_stage(3, "Data acquisition (xauusd_data.csv)")
 def stage_data(ctx):
+    # 1) Reuse an existing local CSV if present
     candidates = [
         os.path.join(BASE_DIR, "xauusd_data.csv"),
         os.path.join(OUTPUT_DIR, "xauusd_data.csv"),
@@ -251,24 +252,40 @@ def stage_data(ctx):
             record(3, "Data acquisition", "PASS", f"reused local data {path} ({len(df)} rows)")
             return
 
-    if ctx["skip_network"]:
-        record(3, "Data acquisition", "SKIP", "--skip-network set and no local xauusd_data.csv found")
-        return
+    bundled_sample = os.path.join(BUNDLE_DIR, "data", "xauusd_sample.csv")
 
-    if not ctx["mods"]["yfinance"]:
-        record(3, "Data acquisition", "SKIP", "yfinance unavailable (offline light build)")
-        return
+    # 2) Try downloading real market data (yfinance, with ticker fallbacks)
+    src = None
+    if not ctx["skip_network"] and ctx["mods"]["yfinance"]:
+        from data_fetch import fetch_xauusd_data
+        data = fetch_xauusd_data("2015-01-01", "2025-01-01")
+        if data is not None and len(data) > 0:
+            src = ("real", data)
 
-    from data_fetch import fetch_xauusd_data
-    data = fetch_xauusd_data("2015-01-01", "2025-01-01")
-    if data is None or len(data) == 0:
-        record(3, "Data acquisition", "FAIL", "yfinance returned empty data (network restricted?)")
-        return
+    # 3) Offline / download failure -> fall back to the bundled synthetic sample
+    if src is None:
+        if os.path.exists(bundled_sample):
+            import pandas as pd
+            data = pd.read_csv(bundled_sample)
+            src = ("sample", data)
+            log("  Real download unavailable - using bundled SYNTHETIC sample data instead")
+        else:
+            record(3, "Data acquisition", "SKIP",
+                   "no local CSV, download failed, and no bundled sample found")
+            return
 
+    kind, data = src
     out = os.path.join(OUTPUT_DIR, "xauusd_data.csv")
     data.to_csv(out, index=False)
     ctx["data_csv"] = out
-    record(3, "Data acquisition", "PASS", f"downloaded {len(data)} rows -> {out}")
+    ctx["data_is_sample"] = (kind == "sample")
+
+    if kind == "real":
+        record(3, "Data acquisition", "PASS", f"downloaded {len(data)} rows -> {out}")
+    else:
+        record(3, "Data acquisition", "PASS",
+               f"SYNTHETIC sample ({len(data)} rows) -> {out} "
+               f"(replace with real data for meaningful results)")
 
 
 # --------------------------------------------------------------------------- #
@@ -295,11 +312,15 @@ def stage_train_backtest(ctx):
     from trading_env import TradingEnv
 
     df = pd.read_csv(ctx["data_csv"])
-    # Normalise column headers (handles 'date' column and case differences)
-    df.columns = [c.capitalize() if c.lower() in ("open", "high", "low", "close", "volume") else c for c in df.columns]
+    # Normalise column headers (handles 'date' column, case differences, and
+    # MultiIndex columns produced by newer yfinance versions)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [c.capitalize() if str(c).lower() in ("open", "high", "low", "close", "volume") else c for c in df.columns]
     train_end = int(len(df) * 0.8)
     train_df, test_df = df.iloc[:train_end], df.iloc[train_end:]
-    log(f"  Data: {len(df)} rows | train {len(train_df)} / test {len(test_df)}")
+    log(f"  Data: {len(df)} rows | train {len(train_df)} / test {len(test_df)}"
+        + ("  [SYNTHETIC SAMPLE - replace with real data]" if ctx.get("data_is_sample") else ""))
 
     timesteps = 50_000 if ctx["full"] else 2_048
     log(f"  Training PPO for {timesteps} timesteps ({'full' if ctx['full'] else 'fast'} mode, CPU) - a few minutes...")
@@ -328,6 +349,7 @@ def stage_train_backtest(ctx):
     win_rate = len(wins) / len(exits) * 100 if exits else 0.0
     metrics = {
         "timesteps": timesteps,
+        "data_source": "SYNTHETIC SAMPLE" if ctx.get("data_is_sample") else "yfinance/local CSV",
         "test_bars": len(test_df),
         "num_exits": len(exits),
         "win_rate_pct": round(win_rate, 2),
@@ -354,6 +376,9 @@ def stage_train_backtest(ctx):
 
     for k, v in metrics.items():
         log(f"    {k}: {v}")
+    if len(exits) == 0:
+        log("  Note: the model opened no trades on the test set "
+            "(short training on synthetic data - expected; try --full with real data)")
     record(4, "AI training + backtest", "PASS",
            f"win rate {metrics['win_rate_pct']}% | return {metrics['return_pct']}% | details in output/")
 
