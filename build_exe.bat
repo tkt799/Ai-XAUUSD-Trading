@@ -12,6 +12,27 @@ echo   AI-XAUUSD Trading System - Windows EXE Builder
 echo ============================================================
 echo.
 
+rem ---- 0a. Sanity check: this script must sit inside the project folder ----
+set "MISSING="
+for %%F in (ai_xauusd_trading.spec run_all.py trading_env.py optimal_timing_env.py market_regime_detector.py quick_demo.py confidence_sizing_demo.py data_fetch.py) do (
+  if not exist "%%F" set "MISSING=!MISSING! %%F"
+)
+if defined MISSING (
+    echo [ERROR] Required project files not found in:
+    echo   %CD%
+    echo   Missing:%MISSING%
+    echo.
+    echo You probably downloaded ONLY build_exe.bat. The build needs the
+    echo complete project. Please:
+    echo   1. Download the full ZIP:
+    echo      https://github.com/tkt799/Ai-XAUUSD-Trading/archive/refs/heads/arena/019fdf9e-ai-xauusd-trading.zip
+    echo   2. Extract it anywhere.
+    echo   3. Double-click build_exe.bat INSIDE the extracted folder.
+    echo.
+    pause
+    exit /b 1
+)
+
 rem ---- 0. Locate a compatible Python (3.9 - 3.11) --------------------------
 rem  The pinned scientific stack (numpy 1.24 / pandas 2.1 / torch 2.1) has no
 rem  wheels for Python 3.12/3.13, so we actively search for a compatible one.
