@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI-XAUUSD 一键总控程序 (run_all.py)
-====================================
+AI-XAUUSD One-Click Runner (run_all.py)
+=======================================
 
-双击（或运行 `python run_all.py`）后按顺序自动执行全部流程：
+Double-click the built exe (or run ``python run_all.py``) to execute the
+full pipeline in order. All console output is English/ASCII so it renders
+correctly on any Windows code page.
 
-  [阶段 0] 环境自检                 → output/system_report.txt
-  [阶段 1] 冒烟检查（核心环境回归） → 直接调用 trading_env / optimal_timing_env
-  [阶段 2] 快速演示 quick_demo       → output/demo_results.png
-  [阶段 3] 数据获取 xauusd_data.csv  → 优先复用 exe 旁现成数据，否则联网下载
-  [阶段 4] AI 训练 + 回测 (PPO)      → output/ 下的模型、回测报告、净值曲线
-  [阶段 5] 生成总结 SUMMARY.md       → 自动打开输出文件夹
+  [Stage 0] Environment self-check          -> output/system_report.txt
+  [Stage 1] Smoke checks (core env regressions, inline)
+  [Stage 2] Quick demo                      -> output/demo_results.png
+  [Stage 3] Data fetch (xauusd_data.csv)    -> reuse local CSV or download
+  [Stage 4] AI training + backtest (PPO)    -> model, metrics, equity curve
+  [Stage 5] SUMMARY.md + open output folder
 
-每个阶段互不阻塞：某个阶段失败/缺依赖/无网络时标记 SKIP/FAIL 后继续，
-最后统一给出总结表退出码（有 FAIL 返回 1，全 PASS/SKIP 返回 0）。
+Stages are isolated: a missing dependency / no network / failure only marks
+that stage SKIP/FAIL, the pipeline continues. Exit code is 1 if any stage
+FAILed, 0 otherwise.
 
-命令行参数：
-  --fast           快速演示模式（默认）：训练 2048 步
-  --full           完整模式：训练 50000 步（慢）
-  --skip-network   不联网（数据阶段仅使用本地 CSV，无则 SKIP）
-  --no-pause       结束时不等待按键（CI/自动化用）
+CLI options:
+  --fast           Demo mode (default): trains 2048 timesteps
+  --full           Full mode: trains 50000 timesteps (slow)
+  --skip-network   Do not use the network (data stage uses local CSV or SKIP)
+  --no-pause       Do not wait for a keypress at the end (CI/automation)
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import platform
@@ -33,16 +38,24 @@ import time
 import traceback
 from datetime import datetime
 
-# matplotlib 必须在导入 pyplot 前设为非交互后端（exe/无显示环境必需）
+# matplotlib must use a non-interactive backend before pyplot is imported
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+# Make sure exotic Unicode from imported modules never crashes the console
+# (e.g. CP437 code pages on English Windows).
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # --------------------------------------------------------------------------- #
-# 路径处理：兼容普通 python 运行与 PyInstaller 冻结（exe）运行
+# Paths: work both as a plain script and as a PyInstaller-frozen exe
 # --------------------------------------------------------------------------- #
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
-    BASE_DIR = os.path.dirname(sys.executable)          # exe 所在目录（可写）
-    BUNDLE_DIR = sys._MEIPASS                            # PyInstaller 解包目录
+    BASE_DIR = os.path.dirname(sys.executable)          # next to the exe (writable)
+    BUNDLE_DIR = sys._MEIPASS                            # PyInstaller unpack dir
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     BUNDLE_DIR = BASE_DIR
@@ -54,7 +67,7 @@ RESULTS = []  # (stage, name, status, detail)
 
 
 def log(msg=""):
-    """同时打印到控制台并追加到 output/run.log"""
+    """Print to console AND append to output/run.log."""
     line = str(msg)
     print(line, flush=True)
     with open(os.path.join(OUTPUT_DIR, "run.log"), "a", encoding="utf-8") as f:
@@ -62,26 +75,26 @@ def log(msg=""):
 
 
 def record(stage, name, status, detail=""):
-    icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}[status]
-    log(f"  {icon} [{status}] {name}" + (f" — {detail}" if detail else ""))
+    tag = {"PASS": "[ OK ]", "FAIL": "[FAIL]", "SKIP": "[SKIP]"}[status]
+    log(f"  {tag} {name}" + (f" -- {detail}" if detail else ""))
     RESULTS.append((stage, name, status, detail))
 
 
 def run_stage(stage_no, title):
-    """装饰器：把阶段函数包进统一的 try/except 与计时中"""
+    """Decorator: uniform try/except + timing for every pipeline stage."""
     def deco(fn):
         def wrapper(ctx):
             log("")
             log("=" * 62)
-            log(f"▶ 阶段 {stage_no}: {title}")
+            log(f">> STAGE {stage_no}: {title}")
             log("=" * 62)
             t0 = time.time()
             try:
                 fn(ctx)
-            except Exception as e:  # 兜底：任何阶段崩溃都不终止整个流程
+            except Exception as e:  # never let one stage kill the pipeline
                 log(traceback.format_exc())
                 record(stage_no, title, "FAIL", f"{type(e).__name__}: {e}")
-            log(f"  ⏱ 耗时 {time.time() - t0:.1f}s")
+            log(f"  (took {time.time() - t0:.1f}s)")
         return wrapper
     return deco
 
@@ -94,9 +107,9 @@ def try_import(name):
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 0：环境自检
+# Stage 0: environment check
 # --------------------------------------------------------------------------- #
-@run_stage(0, "环境自检")
+@run_stage(0, "Environment self-check")
 def stage_environment(ctx):
     mods = {
         "numpy": try_import("numpy"),
@@ -112,13 +125,13 @@ def stage_environment(ctx):
     ctx["mods"] = mods
 
     lines = [
-        "AI-XAUUSD Trading System — 环境自检报告",
-        f"生成时间: {datetime.now().isoformat(timespec='seconds')}",
-        f"运行模式: {'PyInstaller exe' if FROZEN else 'python 脚本'}",
-        f"操作系统: {platform.platform()}",
-        f"Python: {sys.version.split()[0]}  ({sys.executable})",
+        "AI-XAUUSD Trading System -- Environment report",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"Run mode:  {'PyInstaller exe' if FROZEN else 'python script'}",
+        f"OS:        {platform.platform()}",
+        f"Python:    {sys.version.split()[0]}  ({sys.executable})",
         "",
-        "依赖可用性：",
+        "Dependencies:",
     ]
     for name, mod in mods.items():
         ver = getattr(mod, "__version__", "?") if mod else None
@@ -129,19 +142,22 @@ def stage_environment(ctx):
         f.write("\n".join(lines) + "\n")
 
     if not mods["numpy"] or not mods["pandas"] or not mods["gymnasium"]:
-        record(0, "环境自检", "FAIL", "缺少 numpy/pandas/gymnasium 核心依赖")
+        record(0, "Environment check", "FAIL", "missing numpy/pandas/gymnasium")
     else:
-        record(0, "环境自检", "PASS",
-               "重依赖(torch/SB3) " + ("已可用" if ctx["mods"]["torch"] and ctx["mods"]["stable_baselines3"] else "不可用，训练阶段将跳过"))
+        record(0, "Environment check", "PASS",
+               "heavy deps (torch/SB3) "
+               + ("available" if ctx["mods"]["torch"] and ctx["mods"]["stable_baselines3"]
+                  else "missing - training stage will SKIP"))
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 1：冒烟检查（与 tests/test_smoke.py 同源的回归场景，内联实现零依赖 pytest）
+# Stage 1: smoke checks (same regression scenarios as tests/test_smoke.py,
+#          implemented inline so no pytest dependency is needed)
 # --------------------------------------------------------------------------- #
-@run_stage(1, "冒烟检查（核心环境回归）")
+@run_stage(1, "Smoke checks (core environment regressions)")
 def stage_smoke(ctx):
     if not all(ctx["mods"][m] for m in ("numpy", "pandas", "gymnasium")):
-        record(1, "冒烟检查", "SKIP", "缺少 numpy/pandas/gymnasium")
+        record(1, "Smoke checks", "SKIP", "missing numpy/pandas/gymnasium")
         return
 
     import numpy as np
@@ -156,14 +172,16 @@ def stage_smoke(ctx):
 
     checks = []
 
-    # 1. 环境可实例化 + Gymnasium API 契约（回归：坏合并导致的 AttributeError/RecursionError）
+    # 1. Env instantiates + Gymnasium API contract
+    #    (regression: bad merge caused AttributeError/RecursionError)
     env = TradingEnv(df)
     obs, info = env.reset()
-    checks.append(("TradingEnv 实例化 + reset→(obs,info)", obs.shape == (15,)))
+    checks.append(("TradingEnv instantiates, reset->(obs,info)", obs.shape == (15,)))
     out = env.step(np.array([0.0], dtype=np.float32))
-    checks.append(("step 返回 Gymnasium 5 元组", len(out) == 5))
+    checks.append(("step returns Gymnasium 5-tuple", len(out) == 5))
 
-    # 2. 止损必须真实亏钱（回归：退出时 PnL 被错误记为 $0）
+    # 2. Stop losses must book real losses
+    #    (regression: exits used to register $0 PnL)
     env._update_regime_parameters = lambda: None
     env.reset()
     env.position, env.entry_price = 25.0, 2000.0
@@ -175,46 +193,51 @@ def stage_smoke(ctx):
     env.current_step = step
     env.step(np.array([0.0], dtype=np.float32))
     exit_trades = [t for t in env.trades if t["action"] == "exit"]
-    checks.append(("止损退出记入负 PnL", bool(exit_trades) and exit_trades[-1]["profit"] < 0))
-    checks.append(("亏损后余额下降", env.balance < env.initial_balance))
+    checks.append(("Stop-loss exit books NEGATIVE pnl", bool(exit_trades) and exit_trades[-1]["profit"] < 0))
+    checks.append(("Balance decreases after losing trade", env.balance < env.initial_balance))
 
-    # 3. OptimalTimingTradingEnv 观测与声明空间一致（回归：135≠120 维度不匹配）
+    # 3. OptimalTimingTradingEnv observation matches declared space
+    #    (regression: 135 declared vs 120 actual)
     env2 = OptimalTimingTradingEnv(df)
     obs2, _ = env2.reset()
-    checks.append(("OptimalTimingEnv 观测维度一致", obs2.shape == env2.observation_space.shape))
+    checks.append(("OptimalTimingEnv obs matches space", obs2.shape == env2.observation_space.shape))
 
     for name, ok in checks:
         record(1, name, "PASS" if ok else "FAIL")
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 2：快速演示 quick_demo
+# Stage 2: quick demo (its internal console text is redirected to a log file,
+#          so the console stays clean English regardless of the demo's prints)
 # --------------------------------------------------------------------------- #
-@run_stage(2, "快速演示 quick_demo")
+@run_stage(2, "Quick demo (quick_demo)")
 def stage_quick_demo(ctx):
     if not all(ctx["mods"][m] for m in ("numpy", "pandas", "matplotlib")):
-        record(2, "quick_demo", "SKIP", "缺少 numpy/pandas/matplotlib")
+        record(2, "quick_demo", "SKIP", "missing numpy/pandas/matplotlib")
         return
 
     cwd = os.getcwd()
-    os.chdir(OUTPUT_DIR)  # demo 会把 demo_results.png 写到当前目录
+    os.chdir(OUTPUT_DIR)  # the demo writes demo_results.png into the CWD
+    demo_log_path = os.path.join(OUTPUT_DIR, "quick_demo_console.log")
     try:
         import quick_demo
-        rc = quick_demo.main()
+        with open(demo_log_path, "w", encoding="utf-8", errors="replace") as sink:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = quick_demo.main()
     finally:
         os.chdir(cwd)
 
     png = os.path.join(OUTPUT_DIR, "demo_results.png")
     if rc == 0 and os.path.exists(png):
-        record(2, "quick_demo", "PASS", f"图表: {png}")
+        record(2, "quick_demo", "PASS", f"chart: {png} (console text: quick_demo_console.log)")
     else:
-        record(2, "quick_demo", "FAIL", f"返回码 {rc}")
+        record(2, "quick_demo", "FAIL", f"return code {rc}")
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 3：数据获取
+# Stage 3: data acquisition
 # --------------------------------------------------------------------------- #
-@run_stage(3, "数据获取 xauusd_data.csv")
+@run_stage(3, "Data acquisition (xauusd_data.csv)")
 def stage_data(ctx):
     candidates = [
         os.path.join(BASE_DIR, "xauusd_data.csv"),
@@ -225,41 +248,41 @@ def stage_data(ctx):
             import pandas as pd
             df = pd.read_csv(path)
             ctx["data_csv"] = path
-            record(3, "数据获取", "PASS", f"复用本地数据 {path}（{len(df)} 行）")
+            record(3, "Data acquisition", "PASS", f"reused local data {path} ({len(df)} rows)")
             return
 
     if ctx["skip_network"]:
-        record(3, "数据获取", "SKIP", "--skip-network 且无本地 xauusd_data.csv")
+        record(3, "Data acquisition", "SKIP", "--skip-network set and no local xauusd_data.csv found")
         return
 
     if not ctx["mods"]["yfinance"]:
-        record(3, "数据获取", "SKIP", "yfinance 不可用（无网络依赖包）")
+        record(3, "Data acquisition", "SKIP", "yfinance unavailable (offline light build)")
         return
 
     from data_fetch import fetch_xauusd_data
     data = fetch_xauusd_data("2015-01-01", "2025-01-01")
     if data is None or len(data) == 0:
-        record(3, "数据获取", "FAIL", "yfinance 返回空数据（网络受限？）")
+        record(3, "Data acquisition", "FAIL", "yfinance returned empty data (network restricted?)")
         return
 
     out = os.path.join(OUTPUT_DIR, "xauusd_data.csv")
     data.to_csv(out, index=False)
     ctx["data_csv"] = out
-    record(3, "数据获取", "PASS", f"已下载 {len(data)} 行 → {out}")
+    record(3, "Data acquisition", "PASS", f"downloaded {len(data)} rows -> {out}")
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 4：AI 训练 + 回测（重依赖：torch + stable-baselines3）
+# Stage 4: AI training + backtest (heavy deps: torch + stable-baselines3)
 # --------------------------------------------------------------------------- #
-@run_stage(4, "AI 训练 + 回测 (PPO)")
+@run_stage(4, "AI training + backtest (PPO)")
 def stage_train_backtest(ctx):
     mods = ctx["mods"]
     if not (mods["torch"] and mods["stable_baselines3"]):
-        record(4, "AI 训练 + 回测", "SKIP",
-               "torch/stable-baselines3 不可用（轻量 exe 或未安装重依赖）")
+        record(4, "AI training + backtest", "SKIP",
+               "torch/stable-baselines3 unavailable (light build or missing heavy deps)")
         return
     if not ctx.get("data_csv"):
-        record(4, "AI 训练 + 回测", "SKIP", "无训练数据")
+        record(4, "AI training + backtest", "SKIP", "no training data")
         return
 
     import numpy as np
@@ -272,14 +295,14 @@ def stage_train_backtest(ctx):
     from trading_env import TradingEnv
 
     df = pd.read_csv(ctx["data_csv"])
-    # 兼容 fetch 输出的 'date' 列与表头大小写差异
+    # Normalise column headers (handles 'date' column and case differences)
     df.columns = [c.capitalize() if c.lower() in ("open", "high", "low", "close", "volume") else c for c in df.columns]
     train_end = int(len(df) * 0.8)
     train_df, test_df = df.iloc[:train_end], df.iloc[train_end:]
-    log(f"  数据 {len(df)} 行 | 训练 {len(train_df)} / 测试 {len(test_df)}")
+    log(f"  Data: {len(df)} rows | train {len(train_df)} / test {len(test_df)}")
 
     timesteps = 50_000 if ctx["full"] else 2_048
-    log(f"  训练 PPO：{timesteps} 步（{'完整' if ctx['full'] else '快速'}模式，CPU）约需数分钟…")
+    log(f"  Training PPO for {timesteps} timesteps ({'full' if ctx['full'] else 'fast'} mode, CPU) - a few minutes...")
 
     env = DummyVecEnv([lambda: TradingEnv(train_df)])
     model = PPO("MlpPolicy", env, verbose=0, n_steps=512, batch_size=64, seed=42)
@@ -287,9 +310,9 @@ def stage_train_backtest(ctx):
 
     model_path = os.path.join(OUTPUT_DIR, "ppo_trading_model_retrained")
     model.save(model_path)
-    log(f"  模型已保存: {model_path}.zip")
+    log(f"  Model saved: {model_path}.zip")
 
-    # --- 回测（Gymnasium API 5 元组） ---
+    # --- Backtest (Gymnasium 5-tuple API) ---
     test_env = TradingEnv(test_df)
     obs, _ = test_env.reset()
     done = False
@@ -314,13 +337,13 @@ def stage_train_backtest(ctx):
         "return_pct": round(test_env.total_profit / test_env.initial_balance * 100, 2),
     }
     with open(os.path.join(OUTPUT_DIR, "backtest_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
+        json.dump(metrics, f, indent=2)
     pd.DataFrame(test_env.trades).to_csv(os.path.join(OUTPUT_DIR, "trades_log.csv"), index=False)
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(balances)
     ax.axhline(test_env.initial_balance, ls="--", c="gray", alpha=0.6)
-    ax.set_title("PPO retrain — equity curve (test set)")
+    ax.set_title("PPO retrain - equity curve (test set)")
     ax.set_xlabel("step")
     ax.set_ylabel("balance ($)")
     ax.grid(alpha=0.3)
@@ -331,24 +354,24 @@ def stage_train_backtest(ctx):
 
     for k, v in metrics.items():
         log(f"    {k}: {v}")
-    record(4, "AI 训练 + 回测", "PASS",
-           f"胜率 {metrics['win_rate_pct']}% | 收益 {metrics['return_pct']}% | 明细见 output/")
+    record(4, "AI training + backtest", "PASS",
+           f"win rate {metrics['win_rate_pct']}% | return {metrics['return_pct']}% | details in output/")
 
 
 # --------------------------------------------------------------------------- #
-# 阶段 5：总结
+# Stage 5: summary
 # --------------------------------------------------------------------------- #
-@run_stage(5, "生成总结报告")
+@run_stage(5, "Writing summary report")
 def stage_summary(ctx):
     lines = [
-        "# AI-XAUUSD 一键运行总结",
+        "# AI-XAUUSD One-Click Run Summary",
         "",
-        f"- 时间: {datetime.now().isoformat(timespec='seconds')}",
-        f"- 模式: {'完整训练' if ctx['full'] else '快速演示'}"
-        + (" | 离线" if ctx["skip_network"] else ""),
-        f"- 输出目录: {OUTPUT_DIR}",
+        f"- Time: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Mode: {'full training' if ctx['full'] else 'fast demo'}"
+        + (" | offline" if ctx["skip_network"] else ""),
+        f"- Output dir: {OUTPUT_DIR}",
         "",
-        "| 阶段 | 项目 | 结果 | 备注 |",
+        "| Stage | Check | Result | Detail |",
         "|---|---|---|---|",
     ]
     has_fail = False
@@ -358,7 +381,7 @@ def stage_summary(ctx):
 
     lines += [
         "",
-        "## 产物清单",
+        "## Artifacts",
     ]
     for fname in sorted(os.listdir(OUTPUT_DIR)):
         if fname != "run.log":
@@ -367,12 +390,12 @@ def stage_summary(ctx):
     summary_path = os.path.join(OUTPUT_DIR, "SUMMARY.md")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    log(f"  总结已写入: {summary_path}")
+    log(f"  Summary written to: {summary_path}")
 
     ctx["has_fail"] = has_fail
-    record(5, "总结报告", "PASS")
+    record(5, "Summary report", "PASS")
 
-    # 尽力打开输出文件夹（Windows 双击场景）
+    # Best-effort: open the output folder (double-click scenario)
     try:
         if sys.platform.startswith("win"):
             os.startfile(OUTPUT_DIR)  # noqa: S606
@@ -383,24 +406,24 @@ def stage_summary(ctx):
 
 
 # --------------------------------------------------------------------------- #
-# 主入口
+# Entry point
 # --------------------------------------------------------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description="AI-XAUUSD 一键总控程序")
+    parser = argparse.ArgumentParser(description="AI-XAUUSD one-click runner")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--fast", action="store_true", default=True, help="快速演示模式（默认）")
-    mode.add_argument("--full", action="store_true", help="完整训练模式（慢）")
-    parser.add_argument("--skip-network", action="store_true", help="不联网")
-    parser.add_argument("--no-pause", action="store_true", help="结束不等待按键")
+    mode.add_argument("--fast", action="store_true", default=True, help="fast demo mode (default)")
+    mode.add_argument("--full", action="store_true", help="full training mode (slow)")
+    parser.add_argument("--skip-network", action="store_true", help="do not use the network")
+    parser.add_argument("--no-pause", action="store_true", help="do not wait for a keypress at the end")
     args = parser.parse_args()
 
-    # 每次运行重建 run.log
+    # Fresh run.log each run
     log_path = os.path.join(OUTPUT_DIR, "run.log")
     if os.path.exists(log_path):
         os.remove(log_path)
 
-    log("🤖 AI-XAUUSD Trading System — 一键总控")
-    log(f"输出目录: {OUTPUT_DIR}")
+    log("AI-XAUUSD Trading System - One-Click Runner")
+    log(f"Output directory: {OUTPUT_DIR}")
 
     ctx = {"full": args.full, "skip_network": args.skip_network, "mods": {},
            "data_csv": None, "has_fail": False}
@@ -410,14 +433,15 @@ def main():
         stage(ctx)
 
     log("")
-    log("🏁 全部阶段结束")
+    log("ALL STAGES FINISHED")
     fails = [r for r in RESULTS if r[2] == "FAIL"]
     skips = [r for r in RESULTS if r[2] == "SKIP"]
-    log(f"统计: PASS {sum(1 for r in RESULTS if r[2] == 'PASS')} 项 | "
-        f"FAIL {len(fails)} 项 | SKIP {len(skips)} 项")
+    log(f"Tally: PASS {sum(1 for r in RESULTS if r[2] == 'PASS')} | "
+        f"FAIL {len(fails)} | SKIP {len(skips)}")
     if skips:
-        log("提示: 被跳过的阶段通常是缺少重依赖或网络；完整 exe 与联网环境会自动启用。")
-    log(f"详细日志: {os.path.join(OUTPUT_DIR, 'run.log')}")
+        log("Note: SKIPped stages usually mean missing heavy deps or network; "
+            "the full exe with internet enables them automatically.")
+    log(f"Full log: {os.path.join(OUTPUT_DIR, 'run.log')}")
 
     if not args.no_pause and sys.platform.startswith("win"):
         try:

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # ==========================================================================
-#  AI-XAUUSD Trading — Linux/macOS 一键打包脚本
-#  生成当前平台的可执行文件 dist/AiXauusdTrading（Windows 请用 build_exe.bat）
+#  AI-XAUUSD Trading - Linux/macOS one-click build script
+#  Produces dist/AiXauusdTrading for the current platform
+#  (on Windows use build_exe.bat instead)
 # ==========================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "============================================================"
-echo "  AI-XAUUSD Trading System - 打包可执行文件"
+echo "  AI-XAUUSD Trading System - Executable Builder"
 echo "============================================================"
 
-MODE="${1:-light}"   # full | light （默认 light）
+MODE="${1:-light}"   # full | light (default: light)
 
-echo "[1/3] 安装依赖 (mode=$MODE) ..."
+echo "[1/3] Installing dependencies (mode=$MODE) ..."
 python3 -m pip install --upgrade pip --quiet
 if [ "$MODE" = "full" ]; then
     python3 -m pip install --quiet torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu || true
@@ -23,14 +24,14 @@ else
 fi
 python3 -m pip install --quiet "pyinstaller>=6.0"
 
-echo "[2/3] PyInstaller 打包中 ..."
+echo "[2/3] Running PyInstaller ..."
 rm -rf dist build
 python3 -m PyInstaller ai_xauusd_trading.spec --clean --noconfirm
 
-echo "[3/3] 完成"
+echo "[3/3] Done"
 echo "============================================================"
 if [ -f dist/AiXauusdTrading ]; then
-    echo "  生成文件: $(pwd)/dist/AiXauusdTrading"
-    echo "  运行: ./dist/AiXauusdTrading        (结果写入 exe 旁 output/)"
+    echo "  Output: $(pwd)/dist/AiXauusdTrading"
+    echo "  Run: ./dist/AiXauusdTrading   (results written to output/ next to it)"
 fi
 echo "============================================================"
