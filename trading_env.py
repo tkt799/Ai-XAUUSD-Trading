@@ -1,15 +1,70 @@
-import gym
+import gymnasium as gym
 import numpy as np
-import pandas as pd
-from gym import spaces
-from market_regime_detector import MarketRegimeDetector, MarketRegime
+from gymnasium import spaces
+
+from market_regime_detector import MarketRegimeDetector
+
+
+def add_technical_indicators(df):
+    """
+    Add the RSI / MACD / MACD_signal columns used by TradingEnv observations.
+
+    Shared by training, backtesting and live trading so the feature pipeline is
+    identical on every code path. Operates on a copy and returns the new frame.
+    """
+    df = df.copy()
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    return df.fillna(0)
+
+
+def build_observation(df, step, position, balance, lookback=10):
+    """
+    Build the canonical 15-dim observation from a 0-based integer `step`:
+    [closes[step-lookback..step-1], RSI, MACD, MACD_signal, position, balance].
+    """
+    df = df.reset_index(drop=True)
+    prices = df.loc[step - lookback:step - 1, 'Close'].values
+    rsi = df.loc[step - 1, 'RSI']
+    macd = df.loc[step - 1, 'MACD']
+    macd_signal = df.loc[step - 1, 'MACD_signal']
+    return np.concatenate([prices, [rsi, macd, macd_signal, position, balance]]).astype(np.float32)
+
 
 class TradingEnv(gym.Env):
     """
-    Custom Gym environment for XAUUSD trading with trailing stops and dynamic exits.
+    Custom Gymnasium environment for XAUUSD trading with trailing stops and dynamic exits.
+
+    Observation: [last `lookback` closes, RSI, MACD, MACD_signal, position, balance]
+    Action: Box(-1, 1, shape=(1,)) — signed trade signal. Magnitude scales position size.
     """
+
+    metadata = {"render_modes": ["human"]}
+
+    # Reward multipliers per exit reason (applied to PnL / initial_balance)
+    REWARD_MULTIPLIERS = {
+        'take_profit': 100,
+        'trailing_stop': 30,
+        'partial_profit': 50,
+        'max_time': 10,
+        'stop_loss': 10,
+        'end_of_data': 10,
+    }
+
     def __init__(self, df, initial_balance=1000, transaction_cost=0, leverage=50, stop_loss_pct=0.02):
-        super(TradingEnv, self).__init__()
+        super().__init__()
 
         self.df = df.reset_index(drop=True)
         self.initial_balance = initial_balance
@@ -17,323 +72,293 @@ class TradingEnv(gym.Env):
         self.leverage = leverage
         self.stop_loss_pct = stop_loss_pct
 
-        # Trailing stop parameters - TIGHTENED for better profit capture
-        self.trailing_stop_pct = 0.025  # Reduced from 5% to 2.5% trailing stop
-        self.trailing_stop_distance = 0  # Current trailing stop level
-        self.highest_price_since_entry = 0  # Track highest price for trailing stops
+        # Trailing stop parameters
+        self.trailing_stop_pct = 0.025
+        self.trailing_stop_distance = 0
+        self.highest_price_since_entry = 0
 
-        # Profit taking parameters - MULTIPLE SCALED TARGETS
-        self.profit_targets = [0.01, 0.02, 0.05, 0.10]  # 1%, 2%, 5%, 10% profit targets
-        self.take_profit_pct = 0.10  # 10% take profit target (final target)
-        self.partial_take_profit_pct = 0.02  # Take partial profits at 2% (reduced from 5%)
+        # Profit taking parameters - multiple scaled targets
+        self.profit_targets = [0.01, 0.02, 0.05, 0.10]
+        self.take_profit_pct = 0.10
+        self.partial_take_profit_pct = 0.02
 
         # Breakeven stop parameters
-        self.breakeven_trigger_pct = 0.015  # Move to breakeven after 1.5% profit
+        self.breakeven_trigger_pct = 0.015
         self.breakeven_activated = False
 
         # Dynamic exit parameters
-        self.max_holding_period = 24  # Max hours to hold position
+        self.max_holding_period = 24
         self.entry_time = None
 
-        # Calculate technical indicators
+        # Market regime detector (used by _update_regime_parameters)
+        self.regime_detector = MarketRegimeDetector()
+        self.current_regime = None
+
+        # Technical indicators (pure data operation — no env-state side effects)
         self._calculate_indicators()
 
         # Action space: continuous action between -1 and 1
         self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
 
-        # Observation space: price history (last 10 closes), RSI, MACD, MACD_signal, position, balance
+        # Observation space: last `lookback` closes + RSI + MACD + MACD_signal + position + balance
         self.lookback = 10
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.lookback + 5,), dtype=np.float32  # 10 prices + RSI + MACD + MACD_signal + position + balance
+            low=-np.inf, high=np.inf, shape=(self.lookback + 5,), dtype=np.float32
         )
 
-        self.trades = []  # Log all trades
+        self.trades = []
 
+        # reset() initialises current_step, after which regime parameters can be applied safely
         self.reset()
 
     def _calculate_indicators(self):
-        """Calculate technical indicators for the dataset"""
-        # RSI
-        delta = self.df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        self.df['RSI'] = 100 - (100 / (1 + rs))
+        """Calculate technical indicators on the dataset. No side effects on env state."""
+        self.df = add_technical_indicators(self.df)
 
-        # MACD
-        ema12 = self.df['Close'].ewm(span=12, adjust=False).mean()
-        ema26 = self.df['Close'].ewm(span=26, adjust=False).mean()
-        self.df['MACD'] = ema12 - ema26
-        self.df['MACD_signal'] = self.df['MACD'].ewm(span=9, adjust=False).mean()
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
 
-        self.df.fillna(0, inplace=True)  # Fill NaN with 0
-        self.trailing_stop_distance = 0  # Current trailing stop level
-        self.highest_price_since_entry = 0  # Track highest price for trailing stops
-
-        # Initialize market regime detector
-        self.regime_detector = MarketRegimeDetector()
-
-        # Dynamic regime-adaptive parameters (will be updated based on current regime)
-        self._update_regime_parameters()
-
-        # Add technical indicators
-
-        # Add technical indicators
-        self._calculate_indicators()
-
-        # Action space: continuous action between -1 and 1
-        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
-
-        # Observation space: price history (last 10 closes), RSI, MACD, MACD_signal, position, balance
-        self.lookback = 10
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.lookback + 5,), dtype=np.float32  # 10 prices + RSI + MACD + MACD_signal + position + balance
-        )
-
-        self.trades = []  # Log all trades
-
-        self.reset()
-
-    def reset(self):
         self.current_step = self.lookback
         self.balance = self.initial_balance
-        self.position = 0  # 0: no position, positive: long amount
+        self.position = 0  # signed quantity; >0 long, <0 short
         self.entry_price = 0
         self.total_profit = 0
-        self.done = False
-        self.trades = []  # Reset trades
+        self.trades = []
 
-        # Reset trailing stop variables
+        # Exit-management state
         self.trailing_stop_distance = 0
         self.highest_price_since_entry = 0
         self.entry_time = None
+        self.breakeven_activated = False
+        self._profit_levels_taken = set()  # scaled profit targets already triggered
 
-        return self._get_observation()
+        self._update_regime_parameters()
 
-    def render(self, mode='human'):
-        print(f"Step: {self.current_step}, Balance: {self.balance}, Position: {self.position}, Total Profit: {self.total_profit}")
+        return self._get_observation(), {}
 
     def _update_regime_parameters(self):
-        """Update trading parameters based on current market regime"""
-        # Detect current regime
+        """Update trading parameters based on the current market regime."""
         current_regime, regime_params = self.regime_detector.detect_regime(self.df, self.current_step)
 
-        # Update trading parameters based on regime
         self.profit_targets = regime_params['profit_targets']
         self.trailing_stop_pct = regime_params['trailing_stop_pct']
-        self.take_profit_pct = regime_params['profit_targets'][-1]  # Last target is final take profit
-        self.partial_take_profit_pct = regime_params['profit_targets'][1]  # Second target for partial profit
+        self.take_profit_pct = regime_params['profit_targets'][-1]
+        self.partial_take_profit_pct = regime_params['profit_targets'][1]
         self.breakeven_trigger_pct = regime_params['breakeven_trigger']
         self.max_holding_period = regime_params['max_holding_time']
 
-        # Store current regime for logging
         self.current_regime = current_regime
 
     def _get_observation(self):
-        prices = self.df.loc[self.current_step - self.lookback:self.current_step - 1, 'Close'].values
-        rsi = self.df.loc[self.current_step - 1, 'RSI']
-        macd = self.df.loc[self.current_step - 1, 'MACD']
-        macd_signal = self.df.loc[self.current_step - 1, 'MACD_signal']
-        return np.concatenate([prices, [rsi, macd, macd_signal, self.position, self.balance]])
+        return build_observation(self.df, self.current_step, self.position,
+                                 self.balance, lookback=self.lookback)
 
     def step(self, action, confidence=1.0):
         """
-        Execute action with confidence-based position sizing and dynamic exits
-        confidence: float between 0 and 1, higher = more confident
+        Execute one trading step.
+
+        Returns the Gymnasium 5-tuple: (observation, reward, terminated, truncated, info).
+        `confidence` (0..1) scales position size; below 0.3 the trade is suppressed.
         """
-        # Update regime parameters dynamically
         self._update_regime_parameters()
 
-        current_price = self.df.loc[self.current_step, 'Close']
-        reward = 0
+        current_price = float(self.df.loc[self.current_step, 'Close'])
+        reward = 0.0
 
-        # Apply confidence to action magnitude
         if isinstance(action, np.ndarray):
-            action = action[0]
+            action = float(action[0])
 
-        # Scale action by confidence (minimum confidence threshold)
-        min_confidence = 0.3  # Minimum confidence to trade
+        # Suppress weak-confidence signals
+        min_confidence = 0.3
         if confidence < min_confidence:
-            action = 0  # Force hold if not confident enough
+            action = 0.0
 
         effective_action = action * confidence
 
-        # Check for dynamic exits first (trailing stops, profit taking, time limits)
-        exit_reason = self._check_dynamic_exits(current_price)
+        # 1) Dynamic exits first (PnL is settled inside, before state is mutated)
+        exit_reason, exit_pnl = self._check_dynamic_exits(current_price)
         if exit_reason:
-            profit = (current_price - self.entry_price) * self.position
-            self.balance += profit
-            self.total_profit += profit
+            multiplier = self.REWARD_MULTIPLIERS.get(
+                exit_reason, self.REWARD_MULTIPLIERS.get('partial_profit' if 'partial' in exit_reason else 0, 20)
+            )
+            reward = exit_pnl / self.initial_balance * multiplier
 
-            # Reward based on exit reason
-            if exit_reason == 'trailing_stop':
-                reward = profit / self.initial_balance * 30  # Moderate reward for trailing stop
-            elif exit_reason == 'take_profit':
-                reward = profit / self.initial_balance * 100  # High reward for profit taking
-            elif exit_reason == 'partial_profit':
-                reward = profit / self.initial_balance * 50   # Good reward for partial profits
-            elif exit_reason == 'max_time':
-                reward = profit / self.initial_balance * 10   # Low reward for time-based exit
-            else:
-                reward = profit / self.initial_balance * 20   # Default reward
-
-            self.trades.append({
-                'step': self.current_step,
-                'action': 'exit',
-                'reason': exit_reason,
-                'price': current_price,
-                'profit': profit,
-                'confidence': confidence
-            })
-
-            # Reset position
-            self.position = 0
-            self.entry_price = 0
-            self.trailing_stop_distance = 0
-            self.highest_price_since_entry = 0
-            self.entry_time = None
-
-        # Execute new trades if no position
+        # 2) Open a new position only if flat and no exit just happened
         elif self.position == 0:
-            if effective_action > 0.1:  # Buy signal
-                # Position size based on action magnitude and confidence
+            if effective_action > 0.1:
                 position_multiplier = min(effective_action, 1.0)
-                confidence_multiplier = confidence ** 0.5
-                self.position = self.balance * self.leverage * position_multiplier * confidence_multiplier / current_price
-                self.entry_price = current_price
-                self.entry_time = self.current_step
-                self.highest_price_since_entry = current_price
-                self.trailing_stop_distance = current_price * (1 - self.trailing_stop_pct)
-                self.breakeven_activated = False  # Reset breakeven flag
-
-                self.trades.append({
-                    'step': self.current_step,
-                    'action': 'buy',
-                    'price': current_price,
-                    'position': self.position,
-                    'confidence': confidence
-                })
-
-            elif effective_action < -0.1:  # Sell signal (short)
-                # Position size based on action magnitude and confidence
+                self._open_position(current_price, direction=1,
+                                    position_multiplier=position_multiplier,
+                                    confidence=confidence)
+            elif effective_action < -0.1:
                 position_multiplier = min(abs(effective_action), 1.0)
-                confidence_multiplier = confidence ** 0.5
-                self.position = -self.balance * self.leverage * position_multiplier * confidence_multiplier / current_price
-                self.entry_price = current_price
-                self.entry_time = self.current_step
-                self.highest_price_since_entry = current_price  # For short positions, track lowest
-                self.trailing_stop_distance = current_price * (1 + self.trailing_stop_pct)
-                self.breakeven_activated = False  # Reset breakeven flag
+                self._open_position(current_price, direction=-1,
+                                    position_multiplier=position_multiplier,
+                                    confidence=confidence)
 
-                self.trades.append({
-                    'step': self.current_step,
-                    'action': 'sell_short',
-                    'price': current_price,
-                    'position': self.position,
-                    'confidence': confidence
-                })
-
-        # Update trailing stops for existing positions
+        # 3) Still in position — trail the stop
         else:
             self._update_trailing_stops(current_price)
 
+        # Advance time
         self.current_step += 1
+        terminated = False
+        truncated = False
+
         if self.current_step >= len(self.df) - 1:
-            self.done = True
+            terminated = True
+            # Force-close any open position so terminal PnL is never left unbooked
+            if self.position != 0:
+                final_price = float(self.df.loc[min(self.current_step, len(self.df) - 1), 'Close'])
+                final_pnl = self._close_position(final_price, 'end_of_data', fraction=1.0)
+                reward += final_pnl / self.initial_balance * self.REWARD_MULTIPLIERS['end_of_data']
 
-        next_obs = self._get_observation()
-        return next_obs, reward, self.done, {}
+        info = {
+            'balance': self.balance,
+            'total_profit': self.total_profit,
+            'position': self.position,
+            'regime': self.current_regime.value if self.current_regime else None,
+        }
+        return self._get_observation(), reward, terminated, truncated, info
 
-    def _check_dynamic_exits(self, current_price):
-        """Check for various exit conditions with improved profit-taking"""
-        if self.position == 0:
-            return None
+    # ------------------------------------------------------------------ #
+    # Position management
+    # ------------------------------------------------------------------ #
 
-        # Calculate current profit percentage
-        if self.position > 0:  # Long position
-            profit_pct = (current_price - self.entry_price) / self.entry_price
-        else:  # Short position
-            profit_pct = (self.entry_price - current_price) / self.entry_price
+    def _open_position(self, price, direction, position_multiplier, confidence):
+        """Open a long (direction=+1) or short (direction=-1) position."""
+        confidence_multiplier = confidence ** 0.5
+        quantity = (self.balance * self.leverage * position_multiplier
+                    * confidence_multiplier / price) * direction
+        self.position = quantity
+        self.entry_price = price
+        self.entry_time = self.current_step
+        self.highest_price_since_entry = price
+        self.breakeven_activated = False
+        self._profit_levels_taken = set()
+        if direction > 0:
+            self.trailing_stop_distance = price * (1 - self.trailing_stop_pct)
+        else:
+            self.trailing_stop_distance = price * (1 + self.trailing_stop_pct)
 
-        # Breakeven stop activation
-        if not self.breakeven_activated and profit_pct >= self.breakeven_trigger_pct:
-            self.breakeven_activated = True
-            # Move trailing stop to breakeven + small buffer
-            buffer_pct = 0.005  # 0.5% buffer above breakeven
-            if self.position > 0:
-                self.trailing_stop_distance = self.entry_price * (1 + buffer_pct)
-            else:
-                self.trailing_stop_distance = self.entry_price * (1 - buffer_pct)
+        self.trades.append({
+            'step': self.current_step,
+            'action': 'buy' if direction > 0 else 'sell_short',
+            'price': price,
+            'position': self.position,
+            'confidence': confidence,
+        })
 
-        # Scaled profit taking - take partial profits at multiple levels
-        for target_pct in sorted(self.profit_targets, reverse=True):
-            if profit_pct >= target_pct:
-                # Calculate how much profit to take at this level
-                if target_pct <= 0.02:  # Small profits (1-2%) - take 25% of position
-                    profit_portion = 0.25
-                    exit_reason = f'profit_{int(target_pct*100)}pct_partial'
-                elif target_pct <= 0.05:  # Medium profits (5%) - take 50% of position
-                    profit_portion = 0.50
-                    exit_reason = f'profit_{int(target_pct*100)}pct_partial'
-                else:  # Large profits (10%) - take full position
-                    profit_portion = 1.0
-                    exit_reason = 'take_profit'
+    def _close_position(self, price, reason, fraction=1.0, confidence=None):
+        """
+        Close `fraction` of the current position and settle its PnL.
 
-                if profit_portion < 1.0:
-                    # Partial exit
-                    self.position *= (1 - profit_portion)
-                    # Don't reset trailing stops for partial exits
-                else:
-                    # Full exit
-                    self.position = 0
-                    self._reset_position_state()
+        Returns the realised (signed) PnL INCLUDING transaction costs.
+        The position state is only fully reset when the whole position is closed.
+        """
+        closed_qty = self.position * fraction
+        pnl = (price - self.entry_price) * closed_qty
+        pnl -= self.transaction_cost * abs(closed_qty) * price
 
-                return exit_reason
+        self.balance += pnl
+        self.total_profit += pnl
+        self.position -= closed_qty
 
-        # Trailing stop check (only if breakeven not activated or profit is positive)
-        if self.position > 0:  # Long position
-            if current_price <= self.trailing_stop_distance:
-                self.position = 0
-                self._reset_position_state()
-                return 'trailing_stop'
-        else:  # Short position
-            if current_price >= self.trailing_stop_distance:
-                self.position = 0
-                self._reset_position_state()
-                return 'trailing_stop'
+        self.trades.append({
+            'step': self.current_step,
+            'action': 'exit',
+            'reason': reason,
+            'price': price,
+            'quantity_closed': closed_qty,
+            'profit': pnl,
+            'confidence': confidence,
+            'partial': fraction < 1.0,
+        })
 
-        # Maximum holding time - more aggressive for losing positions
-        if self.entry_time and (self.current_step - self.entry_time) >= self.max_holding_period:
+        if fraction >= 1.0 or abs(self.position) < 1e-12:
             self.position = 0
             self._reset_position_state()
-            return 'max_time'
 
-        # Early exit for significant losses (stop loss)
-        if profit_pct <= -0.03:  # 3% stop loss
-            self.position = 0
-            self._reset_position_state()
-            return 'stop_loss'
-
-        return None
+        return pnl
 
     def _reset_position_state(self):
-        """Reset position-related state variables"""
+        """Reset per-position state (after a full close)."""
         self.trailing_stop_distance = 0
         self.highest_price_since_entry = 0
         self.entry_price = 0
         self.entry_time = None
         self.breakeven_activated = False
+        self._profit_levels_taken = set()
+
+    def _check_dynamic_exits(self, current_price):
+        """
+        Check exit conditions. Returns (exit_reason, realised_pnl).
+
+        PnL is settled IMMEDIATELY via _close_position() before any state is
+        cleared, so stop losses and trailing stops register real (negative) PnL.
+        """
+        if self.position == 0 or self.entry_price == 0:
+            return None, 0.0
+
+        # Current floating profit percentage (direction-aware)
+        direction = 1 if self.position > 0 else -1
+        profit_pct = (current_price - self.entry_price) / self.entry_price * direction
+
+        # Arm the breakeven stop once profit exceeds the trigger
+        if not self.breakeven_activated and profit_pct >= self.breakeven_trigger_pct:
+            self.breakeven_activated = True
+            buffer_pct = 0.005
+            if self.position > 0:
+                self.trailing_stop_distance = max(self.trailing_stop_distance,
+                                                  self.entry_price * (1 + buffer_pct))
+            else:
+                self.trailing_stop_distance = min(self.trailing_stop_distance,
+                                                  self.entry_price * (1 - buffer_pct))
+
+        # Scaled profit taking — each level triggers at most once per position
+        for target_pct in sorted(self.profit_targets, reverse=True):
+            if target_pct in self._profit_levels_taken:
+                continue
+            if profit_pct >= target_pct:
+                self._profit_levels_taken.add(target_pct)
+                if target_pct >= max(self.profit_targets):
+                    fraction, reason = 1.0, 'take_profit'
+                elif target_pct <= 0.02:
+                    fraction, reason = 0.25, f'profit_{int(target_pct * 100)}pct_partial'
+                else:
+                    fraction, reason = 0.50, f'profit_{int(target_pct * 100)}pct_partial'
+                pnl = self._close_position(current_price, reason, fraction=fraction)
+                return reason, pnl
+
+        # Trailing stop
+        if self.position > 0 and current_price <= self.trailing_stop_distance:
+            pnl = self._close_position(current_price, 'trailing_stop')
+            return 'trailing_stop', pnl
+        if self.position < 0 and current_price >= self.trailing_stop_distance:
+            pnl = self._close_position(current_price, 'trailing_stop')
+            return 'trailing_stop', pnl
+
+        # Maximum holding time
+        if self.entry_time is not None and (self.current_step - self.entry_time) >= self.max_holding_period:
+            pnl = self._close_position(current_price, 'max_time')
+            return 'max_time', pnl
+
+        # Hard stop loss
+        if profit_pct <= -self.stop_loss_pct:
+            pnl = self._close_position(current_price, 'stop_loss')
+            return 'stop_loss', pnl
+
+        return None, 0.0
 
     def _update_trailing_stops(self, current_price):
-        """Update trailing stop levels based on current price"""
-        if self.position > 0:  # Long position
-            if current_price > self.highest_price_since_entry:
-                self.highest_price_since_entry = current_price
-                self.trailing_stop_distance = current_price * (1 - self.trailing_stop_pct)
-        else:  # Short position
-            if current_price < self.highest_price_since_entry:
-                self.highest_price_since_entry = current_price
-                self.trailing_stop_distance = current_price * (1 + self.trailing_stop_pct)
+        """Ratchet the trailing stop in the direction of the trade only."""
+        if self.position > 0 and current_price > self.highest_price_since_entry:
+            self.highest_price_since_entry = current_price
+            self.trailing_stop_distance = current_price * (1 - self.trailing_stop_pct)
+        elif self.position < 0 and current_price < self.highest_price_since_entry:
+            self.highest_price_since_entry = current_price
+            self.trailing_stop_distance = current_price * (1 + self.trailing_stop_pct)
 
     def render(self, mode='human'):
-        print(f"Step: {self.current_step}, Balance: {self.balance}, Position: {self.position}, Total Profit: {self.total_profit}")
+        print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, "
+              f"Position: {self.position:.4f}, Total Profit: {self.total_profit:.2f}")

@@ -4,15 +4,28 @@ Live Trading with Ensemble System
 Combines multiple RL models for real-time trading decisions
 """
 
-import pandas as pd
+import logging
+import os
+import time
+import warnings
+from datetime import datetime, timedelta
+
+# Silence the upstream 'gym is unmaintained, switch to gymnasium' warning that
+# some transitive imports (SB3 compat shims) emit at startup.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Gym has been unmaintained.*",
+    category=DeprecationWarning,
+)
+os.environ.setdefault("GYM_NOTICE_DISABLE", "1")
+
 import numpy as np
+import pandas as pd
+import yfinance as yf
+
 from ensemble_trader import EnsembleTrader
 from market_regime_detector import MarketRegimeDetector
-from trading_env import TradingEnv
-import time
-import logging
-from datetime import datetime, timedelta
-import yfinance as yf
+from trading_env import add_technical_indicators
 
 # Setup logging
 logging.basicConfig(
@@ -47,6 +60,7 @@ class LiveEnsembleTrader:
         # Breakeven stop parameters
         self.breakeven_trigger_pct = 0.015  # Move to breakeven after 1.5% profit
         self.breakeven_activated = False
+        self._profit_levels_taken = set()  # scaled profit targets already triggered
 
         # Load ensemble
         self.ensemble = EnsembleTrader()
@@ -55,10 +69,9 @@ class LiveEnsembleTrader:
         # Initialize market regime detector
         self.regime_detector = MarketRegimeDetector()
 
-        # Trading parameters - will be updated dynamically based on regime
+        # Trading parameters - defaults first, then regime-adaptive overrides
+        self._set_default_parameters()
         self._update_regime_parameters()
-        self.stop_loss_pct = 0.02  # 2% stop loss
-        self.max_holding_time = 24  # Max hours to hold position
 
         # Performance tracking
         self.trades = []
@@ -95,7 +108,7 @@ class LiveEnsembleTrader:
             self._set_default_parameters()
 
     def _set_default_parameters(self):
-        """Set default trading parameters when regime detection fails"""
+        """Set default trading parameters when regime detection fails or has not run yet"""
         self.profit_targets = [0.01, 0.02, 0.05, 0.10]
         self.trailing_stop_pct = 0.025
         self.take_profit_pct = 0.10
@@ -103,13 +116,19 @@ class LiveEnsembleTrader:
         self.breakeven_trigger_pct = 0.015
         self.max_holding_time = 24
         self.min_signal_strength = 0.2
+        self.stop_loss_pct = 0.02
 
-    def get_recent_market_data(self):
-        """Get recent market data for regime detection"""
+    def get_recent_market_data(self, symbol='GC=F', period='3mo', interval='1h'):
+        """Fetch recent market data for regime detection (~3 months of hourly bars).
+
+        Returns None when data is unavailable so callers fall back to defaults.
+        """
         try:
-            # This would fetch recent data - for now return None
-            # In production, this would fetch the last 100+ periods of data
-            return None
+            data = yf.download(symbol, period=period, interval=interval, progress=False)
+            if data is None or data.empty:
+                return None
+            # Futures often have sparse/NaN volume — only require valid closes
+            return data.dropna(subset=['Close'])
         except Exception as e:
             logging.error(f"Could not fetch recent market data: {e}")
             return None
@@ -122,56 +141,28 @@ class LiveEnsembleTrader:
                 logging.warning("No data received from Yahoo Finance")
                 return None
 
-            # Add technical indicators
-            data = self.add_technical_indicators(data)
+            # Add technical indicators (shared pipeline with the training environment)
+            data = add_technical_indicators(data)
             return data
         except Exception as e:
             logging.error(f"Error fetching live data: {e}")
             return None
 
-    def add_technical_indicators(self, df):
-        """Add technical indicators to dataframe"""
-        # RSI
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # MACD
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-        # Bollinger Bands
-        df['SMA20'] = df['Close'].rolling(window=20).mean()
-        df['STD20'] = df['Close'].rolling(window=20).std()
-        df['Upper_Band'] = df['SMA20'] + (df['STD20'] * 2)
-        df['Lower_Band'] = df['SMA20'] - (df['STD20'] * 2)
-
-        # Stochastic Oscillator
-        low_min = df['Low'].rolling(window=14).min()
-        high_max = df['High'].rolling(window=14).max()
-        df['%K'] = 100 * ((df['Close'] - low_min) / (high_max - low_min))
-        df['%D'] = df['%K'].rolling(window=3).mean()
-
-        return df.dropna()
-
     def get_observation(self, df):
-        """Create observation from latest data"""
+        """Create observation from latest data.
+
+        MUST match TradingEnv's 15-dim layout — [last 10 closes, RSI, MACD,
+        MACD_signal, position, balance] — unnormalised, exactly as in training.
+        """
+        lookback = 10
+        closes = df['Close'].iloc[-lookback:].values
         latest = df.iloc[-1]
 
-        # Create observation array matching training environment
-        obs = np.array([
-            latest['Close'] / 2000,  # Normalized price
-            latest['RSI'] / 100,     # RSI
-            latest['MACD'] / 10,     # MACD
-            latest['Signal_Line'] / 10,  # Signal line
-            (latest['Close'] - latest['Lower_Band']) / (latest['Upper_Band'] - latest['Lower_Band']),  # Bollinger position
-            latest['%K'] / 100,      # Stochastic %K
-            latest['%D'] / 100,      # Stochastic %D
-        ])
+        obs = np.concatenate([
+            closes,
+            [latest['RSI'], latest['MACD'], latest['MACD_signal'],
+             self.position, self.capital],
+        ]).astype(np.float32)
 
         return obs.reshape(1, -1)
 
@@ -214,6 +205,7 @@ class LiveEnsembleTrader:
             self.highest_price_since_entry = 0
             self.current_trade_start = None
             self.breakeven_activated = False  # Reset breakeven flag
+            self._profit_levels_taken = set()  # Reset scaled profit targets
 
         elif self.position == 0:  # No position - check for entry
             if action > self.min_signal_strength:  # Buy signal
@@ -226,6 +218,7 @@ class LiveEnsembleTrader:
                 self.highest_price_since_entry = current_price
                 self.trailing_stop_distance = current_price * (1 - self.trailing_stop_pct)
                 self.breakeven_activated = False  # Reset breakeven flag
+                self._profit_levels_taken = set()  # Reset scaled profit targets
                 logging.info(f"BUY at {current_price:.2f} - Size: {position_size:.4f} - Confidence: {confidence:.3f}")
 
             elif action < -self.min_signal_strength:  # Sell signal
@@ -238,6 +231,7 @@ class LiveEnsembleTrader:
                 self.highest_price_since_entry = current_price
                 self.trailing_stop_distance = current_price * (1 + self.trailing_stop_pct)
                 self.breakeven_activated = False  # Reset breakeven flag
+                self._profit_levels_taken = set()  # Reset scaled profit targets
                 logging.info(f"SELL at {current_price:.2f} - Size: {position_size:.4f} - Confidence: {confidence:.3f}")
 
         else:  # Have position - update trailing stops
@@ -264,9 +258,12 @@ class LiveEnsembleTrader:
             else:
                 self.trailing_stop_distance = self.entry_price * (1 - buffer_pct)
 
-        # Scaled profit taking - take partial profits at multiple levels
+        # Scaled profit taking - each level triggers at most once per position
         for target_pct in sorted(self.profit_targets, reverse=True):
+            if target_pct in self._profit_levels_taken:
+                continue
             if profit_pct >= target_pct:
+                self._profit_levels_taken.add(target_pct)
                 # Calculate how much profit to take at this level
                 if target_pct <= 0.02:  # Small profits (1-2%) - take 25% of position
                     profit_portion = 0.25
@@ -317,8 +314,8 @@ class LiveEnsembleTrader:
         if self.current_trade_start and (datetime.now() - self.current_trade_start).seconds > self.max_holding_time * 3600:
             return 'max_time'
 
-        # Early exit for significant losses (stop loss)
-        if profit_pct <= -0.03:  # 3% stop loss
+        # Early exit for significant losses (hard stop loss)
+        if profit_pct <= -self.stop_loss_pct:
             return 'stop_loss'
 
         return None
@@ -358,8 +355,18 @@ class LiveEnsembleTrader:
                         obs = self.get_observation(data)
                         action, confidence = self.ensemble.predict_ensemble(obs)
 
+                        # Normalise scalars (SB3 returns np.ndarray[shape=(1,)])
+                        if hasattr(action, '__len__'):
+                            action = float(action[0])
+                        else:
+                            action = float(action)
+                        if hasattr(confidence, '__len__'):
+                            confidence = float(confidence[0])
+                        else:
+                            confidence = float(confidence)
+
                         # Execute trade
-                        current_price = data.iloc[-1]['Close']
+                        current_price = float(data.iloc[-1]['Close'])
                         self.execute_trade(action, confidence, current_price)
 
                         # Log status

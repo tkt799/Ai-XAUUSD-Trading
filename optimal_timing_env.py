@@ -2,28 +2,42 @@
 """
 Enhanced Trading Environment for Optimal Entry/Exit Timing
 Focuses on teaching models to identify the best buy and sell points
+
+NOTE: rewards only use information available up to the current bar —
+no look-ahead / future data is used anywhere in this environment.
 """
 
-import gym
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-from gym import spaces
-import talib
+from gymnasium import spaces
+
 
 class OptimalTimingTradingEnv(gym.Env):
-    """
-    Enhanced trading environment that teaches optimal entry/exit timing
-    """
+    """Enhanced trading environment that teaches optimal entry/exit timing."""
+
+    metadata = {"render_modes": ["human"]}
+
+    # [Open, High, Low, Close, Volume] x lookback
+    OHLCV_FEATURES = 5
+    # Must match the exact indicator list used in _get_observation()
+    INDICATOR_COLUMNS = [
+        'RSI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST',
+        'STOCH_K', 'STOCH_D', 'WILLR', 'CCI',
+        'ATR', 'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
+        'OBV', 'AD', 'PIVOT',
+    ]
+    POSITION_FEATURES = 5  # position, position_size, holding_time, unrealized pnl %, normalized balance
 
     def __init__(self, df, initial_balance=1000, leverage=50, transaction_cost=0.0002):
-        super(OptimalTimingTradingEnv, self).__init__()
+        super().__init__()
 
         self.df = df.reset_index(drop=True)
         self.initial_balance = initial_balance
         self.leverage = leverage
         self.transaction_cost = transaction_cost
 
-        # Enhanced technical indicators for timing
+        # Enhanced technical indicators for timing (pure pandas — no TA-Lib dependency)
         self._add_advanced_indicators()
 
         # Action space: [position_size, entry_threshold, exit_threshold]
@@ -36,9 +50,10 @@ class OptimalTimingTradingEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Enhanced observation space
-        self.lookback = 20  # More historical data
-        obs_size = self.lookback * 6 + 15  # prices + volumes + 13 indicators + position info
+        self.lookback = 20
+        obs_size = (self.lookback * self.OHLCV_FEATURES
+                    + len(self.INDICATOR_COLUMNS)
+                    + self.POSITION_FEATURES)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -46,45 +61,75 @@ class OptimalTimingTradingEnv(gym.Env):
         self.reset()
 
     def _add_advanced_indicators(self):
-        """Add comprehensive technical indicators for timing analysis"""
-        close = self.df['Close'].values
-        high = self.df['High'].values
-        low = self.df['Low'].values
-        volume = self.df['Volume'].values
+        """Add comprehensive technical indicators for timing analysis (pandas-only)."""
+        close = self.df['Close']
+        high = self.df['High']
+        low = self.df['Low']
+        volume = self.df['Volume']
 
         # Trend indicators
-        self.df['SMA_20'] = talib.SMA(close, timeperiod=20)
-        self.df['SMA_50'] = talib.SMA(close, timeperiod=50)
-        self.df['EMA_12'] = talib.EMA(close, timeperiod=12)
-        self.df['EMA_26'] = talib.EMA(close, timeperiod=26)
+        self.df['SMA_20'] = close.rolling(20).mean()
+        self.df['SMA_50'] = close.rolling(50).mean()
+        self.df['EMA_12'] = close.ewm(span=12, adjust=False).mean()
+        self.df['EMA_26'] = close.ewm(span=26, adjust=False).mean()
 
-        # Momentum indicators
-        self.df['RSI'] = talib.RSI(close, timeperiod=14)
-        self.df['MACD'], self.df['MACD_SIGNAL'], self.df['MACD_HIST'] = talib.MACD(close)
-        self.df['STOCH_K'], self.df['STOCH_D'] = talib.STOCH(high, low, close)
-        self.df['WILLR'] = talib.WILLR(high, low, close)
-        self.df['CCI'] = talib.CCI(high, low, close, timeperiod=14)
+        # Momentum indicators (Wilder-smoothed RSI, same family as TA-Lib)
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rs = gain / loss
+        self.df['RSI'] = 100 - (100 / (1 + rs))
+
+        self.df['MACD'] = self.df['EMA_12'] - self.df['EMA_26']
+        self.df['MACD_SIGNAL'] = self.df['MACD'].ewm(span=9, adjust=False).mean()
+        self.df['MACD_HIST'] = self.df['MACD'] - self.df['MACD_SIGNAL']
+
+        lowest_low = low.rolling(14).min()
+        highest_high = high.rolling(14).max()
+        stoch_range = (highest_high - lowest_low).replace(0, np.nan)
+        self.df['STOCH_K'] = 100 * (close - lowest_low) / stoch_range
+        self.df['STOCH_D'] = self.df['STOCH_K'].rolling(3).mean()
+        self.df['WILLR'] = -100 * (highest_high - close) / stoch_range
+
+        typical_price = (high + low + close) / 3
+        tp_sma = typical_price.rolling(14).mean()
+        mean_dev = (typical_price - tp_sma).abs().rolling(14).mean()
+        self.df['CCI'] = (typical_price - tp_sma) / (0.015 * mean_dev.replace(0, np.nan))
 
         # Volatility indicators
-        self.df['ATR'] = talib.ATR(high, low, close, timeperiod=14)
-        self.df['BB_UPPER'], self.df['BB_MIDDLE'], self.df['BB_LOWER'] = talib.BBANDS(close)
-        self.df['NATR'] = talib.NATR(high, low, close, timeperiod=14)
+        prev_close = close.shift(1)
+        true_range = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+                               axis=1).max(axis=1)
+        self.df['ATR'] = true_range.ewm(alpha=1 / 14, adjust=False).mean()  # Wilder smoothing
+        self.df['NATR'] = self.df['ATR'] / close * 100
+
+        bb_middle = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
+        self.df['BB_MIDDLE'] = bb_middle
+        self.df['BB_UPPER'] = bb_middle + 2 * bb_std
+        self.df['BB_LOWER'] = bb_middle - 2 * bb_std
 
         # Volume indicators
-        self.df['OBV'] = talib.OBV(close, volume)
-        self.df['AD'] = talib.AD(high, low, close, volume)
-        self.df['ADOSC'] = talib.ADOSC(high, low, close, volume)
+        direction = np.sign(close.diff()).fillna(0)
+        self.df['OBV'] = (direction * volume).cumsum()
+
+        clv = (((close - low) - (high - close)) / (high - low).replace(0, np.nan)).fillna(0)
+        ad_line = (clv * volume).cumsum()
+        self.df['AD'] = ad_line
+        self.df['ADOSC'] = (ad_line.ewm(span=3, adjust=False).mean()
+                            - ad_line.ewm(span=10, adjust=False).mean())
 
         # Support/Resistance levels (simplified)
-        self.df['PIVOT'] = (high + low + close) / 3
+        self.df['PIVOT'] = typical_price
         self.df['R1'] = 2 * self.df['PIVOT'] - low
         self.df['S1'] = 2 * self.df['PIVOT'] - high
 
         # Fill NaN values
-        self.df.fillna(method='bfill', inplace=True)
-        self.df.fillna(0, inplace=True)
+        self.df = self.df.bfill().fillna(0)
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
         self.current_step = self.lookback
         self.balance = self.initial_balance
         self.position = 0  # -1 (short), 0 (neutral), 1 (long)
@@ -96,85 +141,65 @@ class OptimalTimingTradingEnv(gym.Env):
         self.trades = []
         self.holding_time = 0
 
-        return self._get_observation()
+        return self._get_observation(), {}
 
     def _get_observation(self):
-        """Create comprehensive observation for timing decisions"""
+        """Create comprehensive observation for timing decisions."""
         start_idx = self.current_step - self.lookback
         end_idx = self.current_step
 
-        # Price data (OHLCV)
-        prices = self.df.iloc[start_idx:end_idx][['Open', 'High', 'Low', 'Close', 'Volume']].values.flatten()
+        # Price data (OHLCV) over the lookback window
+        prices = (self.df.iloc[start_idx:end_idx][['Open', 'High', 'Low', 'Close', 'Volume']]
+                  .values.flatten())
 
-        # Technical indicators
-        indicators = self.df.iloc[self.current_step][[
-            'RSI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST',
-            'STOCH_K', 'STOCH_D', 'WILLR', 'CCI',
-            'ATR', 'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
-            'OBV', 'AD', 'PIVOT'
-        ]].values
+        # Technical indicators at the current bar
+        indicators = self.df.iloc[self.current_step][self.INDICATOR_COLUMNS].values.astype(np.float64)
 
         # Position information
         position_info = np.array([
-            self.position,  # Current position (-1, 0, 1)
-            self.position_size,  # Position size (0-1)
-            self.holding_time,  # Bars held
-            (self.df.iloc[self.current_step]['Close'] - self.entry_price) / max(self.entry_price, 0.01) if self.entry_price > 0 else 0,  # Unrealized P&L %
-            self.balance / self.initial_balance  # Normalized balance
+            self.position,
+            self.position_size,
+            self.holding_time,
+            (self.df.iloc[self.current_step]['Close'] - self.entry_price) / max(self.entry_price, 1e-9)
+            if self.entry_price > 0 else 0,
+            self.balance / self.initial_balance,
         ])
 
-        return np.concatenate([prices, indicators, position_info])
+        return np.concatenate([prices, indicators, position_info]).astype(np.float32)
 
-    def _calculate_timing_reward(self, action, current_price, next_price):
-        """Calculate reward based on timing quality"""
+    def _calculate_timing_reward(self, action, current_price):
+        """
+        Reward shaping based on realised, already-known information ONLY.
+
+        No future bars are inspected — the previous version peeked 10 bars
+        ahead (look-ahead bias) and has been removed.
+        """
         position_size, entry_threshold, exit_threshold = action
+        reward = 0.0
 
-        reward = 0
-
-        # Entry timing reward
+        # Small bonus for acting on a confident entry signal
         if self.position == 0 and abs(position_size) > entry_threshold:
-            # Evaluate if this is a good entry point
-            future_returns = []
-            for i in range(1, min(11, len(self.df) - self.current_step)):  # Look ahead 10 bars
-                future_price = self.df.iloc[self.current_step + i]['Close']
-                ret = (future_price - current_price) / current_price
-                future_returns.append(ret)
+            reward += 0.05
+            # Align bonus sign with very recent momentum (information from the past, not the future)
+            past = self.df.iloc[max(0, self.current_step - 5):self.current_step + 1]['Close']
+            if len(past) > 1:
+                recent_return = (past.iloc[-1] - past.iloc[0]) / past.iloc[0]
+                reward += 0.05 * np.sign(position_size) * np.sign(recent_return)
 
-            if future_returns:
-                avg_future_return = np.mean(future_returns[:5])  # 5-bar average
-                if position_size > 0:  # Long position
-                    reward += avg_future_return * 10  # Reward for buying before price increase
-                else:  # Short position
-                    reward -= avg_future_return * 10  # Reward for selling before price decrease
+        # Realised PnL on exit is accounted for in step()/_close_position().
 
-        # Exit timing reward
-        elif self.position != 0 and abs(position_size) < exit_threshold:
-            # Evaluate if this is a good exit point
-            entry_return = (current_price - self.entry_price) / self.entry_price
-            if self.position > 0:  # Was long
-                reward += entry_return * 5  # Reward based on profit captured
-            else:  # Was short
-                reward -= entry_return * 5
-
-        # Holding penalty (encourage active trading)
+        # Holding penalty (encourage decisive management)
         if self.position != 0:
-            reward -= 0.01  # Small penalty for holding
+            reward -= 0.01
 
         return reward
 
     def step(self, action):
         position_size, entry_threshold, exit_threshold = action
-        current_price = self.df.iloc[self.current_step]['Close']
-        next_price = self.df.iloc[min(self.current_step + 1, len(self.df) - 1)]['Close']
+        current_price = float(self.df.iloc[self.current_step]['Close'])
 
-        reward = 0
-        done = False
+        reward = self._calculate_timing_reward(action, current_price)
 
-        # Calculate timing-based reward
-        timing_reward = self._calculate_timing_reward(action, current_price, next_price)
-        reward += timing_reward
-
-        # Execute trading logic
         if self.position == 0:  # No position
             if position_size > entry_threshold:  # Buy signal
                 self.position = 1
@@ -182,12 +207,12 @@ class OptimalTimingTradingEnv(gym.Env):
                 self.entry_price = current_price
                 self.holding_time = 0
 
-                # Set stop loss and take profit based on ATR
-                atr = self.df.iloc[self.current_step]['ATR']
+                # Stop loss / take profit from ATR
+                atr = float(self.df.iloc[self.current_step]['ATR'])
                 self.stop_loss = current_price - (atr * 2)
                 self.take_profit = current_price + (atr * 3)
 
-                reward += 0.1  # Small reward for entering position
+                reward += 0.1
 
             elif position_size < -entry_threshold:  # Sell signal
                 self.position = -1
@@ -195,85 +220,99 @@ class OptimalTimingTradingEnv(gym.Env):
                 self.entry_price = current_price
                 self.holding_time = 0
 
-                # Set stop loss and take profit
-                atr = self.df.iloc[self.current_step]['ATR']
+                atr = float(self.df.iloc[self.current_step]['ATR'])
                 self.stop_loss = current_price + (atr * 2)
                 self.take_profit = current_price - (atr * 3)
 
-                reward += 0.1  # Small reward for entering position
+                reward += 0.1
 
         else:  # Have position - check exit conditions
             self.holding_time += 1
 
-            # Check stop loss / take profit
             if self.position == 1:  # Long
                 if current_price <= self.stop_loss:
-                    reward -= 1.0  # Penalty for hitting stop loss
-                    self._close_position(current_price, "stop_loss")
+                    reward -= 1.0
+                    pnl = self._close_position(current_price, "stop_loss")
+                    reward += pnl / self.initial_balance
                 elif current_price >= self.take_profit:
-                    reward += 2.0  # Reward for hitting take profit
-                    self._close_position(current_price, "take_profit")
+                    reward += 2.0
+                    pnl = self._close_position(current_price, "take_profit")
+                    reward += pnl / self.initial_balance
                 elif position_size < -exit_threshold:  # Exit signal
-                    pnl_pct = (current_price - self.entry_price) / self.entry_price
-                    reward += pnl_pct * 5  # Reward based on profit
-                    self._close_position(current_price, "signal_exit")
+                    pnl = self._close_position(current_price, "signal_exit")
+                    reward += (pnl / self.initial_balance) * 5
 
             else:  # Short
                 if current_price >= self.stop_loss:
-                    reward -= 1.0  # Penalty for hitting stop loss
-                    self._close_position(current_price, "stop_loss")
+                    reward -= 1.0
+                    pnl = self._close_position(current_price, "stop_loss")
+                    reward += pnl / self.initial_balance
                 elif current_price <= self.take_profit:
-                    reward += 2.0  # Reward for hitting take profit
-                    self._close_position(current_price, "take_profit")
+                    reward += 2.0
+                    pnl = self._close_position(current_price, "take_profit")
+                    reward += pnl / self.initial_balance
                 elif position_size > exit_threshold:  # Exit signal
-                    pnl_pct = (self.entry_price - current_price) / self.entry_price
-                    reward += pnl_pct * 5  # Reward based on profit
-                    self._close_position(current_price, "signal_exit")
+                    pnl = self._close_position(current_price, "signal_exit")
+                    reward += (pnl / self.initial_balance) * 5
 
             # Max holding time
-            if self.holding_time >= 50:  # Max 50 bars
-                pnl_pct = (current_price - self.entry_price) / self.entry_price * self.position
-                reward += pnl_pct * 2  # Reward/penalty based on final P&L
-                self._close_position(current_price, "max_time")
+            if self.position != 0 and self.holding_time >= 50:  # Max 50 bars
+                pnl = self._close_position(current_price, "max_time")
+                reward += (pnl / self.initial_balance) * 2
 
         # Move to next step
         self.current_step += 1
-        if self.current_step >= len(self.df) - 1:
-            done = True
-            # Final position closure
-            if self.position != 0:
-                final_pnl = (next_price - self.entry_price) / self.entry_price * self.position
-                reward += final_pnl * 3
-                self._close_position(next_price, "end_episode")
+        terminated = False
+        truncated = False
 
-        return self._get_observation(), reward, done, {}
+        if self.current_step >= len(self.df) - 1:
+            terminated = True
+            # Final position closure — settle at the last known price
+            if self.position != 0:
+                final_price = float(self.df.iloc[min(self.current_step, len(self.df) - 1)]['Close'])
+                pnl = self._close_position(final_price, "end_episode")
+                reward += (pnl / self.initial_balance) * 3
+
+        info = {
+            'balance': self.balance,
+            'total_pnl': self.total_pnl,
+            'position': self.position,
+        }
+        return self._get_observation(), reward, terminated, truncated, info
 
     def _close_position(self, price, reason):
-        """Close current position and record trade"""
+        """Close current position, settle PnL and record the trade. Returns realised PnL."""
         if self.position == 0:
-            return
+            return 0.0
 
-        pnl = (price - self.entry_price) * self.position * self.position_size * self.leverage
-        pnl -= abs(pnl) * self.transaction_cost  # Transaction cost
+        # Notional-sized PnL: balance * position_size% deployed at `leverage`
+        notional = self.balance * abs(self.position_size) * self.leverage
+        pnl_pct = (price - self.entry_price) / self.entry_price * self.position
+        pnl = notional * pnl_pct
+        pnl -= notional * self.transaction_cost  # Transaction cost on the closed notional
 
         self.balance += pnl
         self.total_pnl += pnl
 
-        trade = {
+        self.trades.append({
             'entry_price': self.entry_price,
             'exit_price': price,
             'position': 'LONG' if self.position == 1 else 'SHORT',
             'pnl': pnl,
             'holding_time': self.holding_time,
-            'exit_reason': reason
-        }
-        self.trades.append(trade)
+            'exit_reason': reason,
+        })
 
         # Reset position
         self.position = 0
         self.position_size = 0
         self.entry_price = 0
+        self.stop_loss = 0
+        self.take_profit = 0
         self.holding_time = 0
 
+        return pnl
+
     def render(self, mode='human'):
-        print(f"Step: {self.current_step}, Balance: ${self.balance:.2f}, Position: {self.position}, Total P&L: ${self.total_pnl:.2f}")
+        print(f"Step: {self.current_step}, Balance: ${self.balance:.2f}, "
+              f"Position: {self.position}, Total P&L: ${self.total_pnl:.2f}")

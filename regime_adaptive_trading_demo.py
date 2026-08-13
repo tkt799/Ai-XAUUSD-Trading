@@ -50,6 +50,10 @@ class RegimeAdaptiveTradingSystem:
 
     def _update_regime_parameters(self, price_data):
         """Update trading parameters based on current market regime"""
+        if price_data is None or len(price_data) < 50:
+            self._set_default_parameters()
+            self.current_regime = MarketRegime.RANGING
+            return
         try:
             current_regime, regime_params = self.regime_detector.detect_regime(price_data, -1)
 
@@ -462,7 +466,10 @@ def plot_regime_adaptive_results(trader, price_data):
             pnl_by_regime = [df_trades[df_trades['regime'] == regime]['pnl'] for regime in regimes]
 
             if pnl_by_regime and all(len(pnl) > 0 for pnl in pnl_by_regime):
-                ax3.boxplot(pnl_by_regime, tick_labels=regimes)
+                try:
+                    ax3.boxplot(pnl_by_regime, tick_labels=regimes)
+                except TypeError:
+                    ax3.boxplot(pnl_by_regime, labels=regimes)
                 ax3.set_title('P&L Distribution by Market Regime')
                 ax3.set_ylabel('P&L ($)')
                 ax3.tick_params(axis='x', rotation=45)

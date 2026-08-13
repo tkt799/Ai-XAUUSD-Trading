@@ -6,19 +6,19 @@ This script provides a fast demonstration of the AI trading system's capabilitie
 without requiring extensive setup or data downloads.
 """
 
+import warnings
+from datetime import datetime, timedelta
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-import warnings
+
 warnings.filterwarnings('ignore')
 
-# Import our trading components
+# Import our trading components (light-weight only — this demo runs without torch/SB3)
 try:
-    from ensemble_trader import EnsembleTrader
-    from market_regime_detector import MarketRegimeDetector
-    from trading_env import TradingEnvironment
     from confidence_sizing_demo import ConfidenceBasedSizer
+    from market_regime_detector import MarketRegime, MarketRegimeDetector
 except ImportError as e:
     print("❌ Error importing trading components. Please ensure all dependencies are installed.")
     print(f"Missing: {e}")
@@ -96,10 +96,9 @@ def simulate_trading_demo(data, initial_capital=1000, leverage=50):
 
         # Detect market regime
         try:
-            regime, params = regime_detector.detect_regime(current_data)
-        except:
-            regime = regime_detector.market_regime.STRONG_BULL
-            params = regime_detector.get_default_params(regime)
+            regime, _params = regime_detector.detect_regime(current_data)
+        except Exception:
+            regime = MarketRegime.STRONG_BULL
 
         # Simulate AI prediction (simplified)
         # In real system, this would come from ensemble models
@@ -108,7 +107,7 @@ def simulate_trading_demo(data, initial_capital=1000, leverage=50):
 
         # Execute trades
         if signal != 0 and position == 0:  # Open position
-            position_size = sizer.calculate_position_size(confidence, 0.02)  # 2% risk
+            position_size = sizer.size_position(confidence, signal, current_price)
             if position_size > 0:
                 position = signal
                 entry_price = current_price
@@ -194,7 +193,7 @@ def print_demo_summary(trades, final_capital):
     print("="*60)
 
     print(f"📊 Total Trades: {len([t for t in trades if t['type'] == 'close'])}")
-    print(f"💰 Initial Capital: $1,000")
+    print("💰 Initial Capital: $1,000")
     print(f"💰 Final Capital: ${final_capital:.2f}")
     print(f"📈 Total Return: ${final_capital - 1000:.2f} ({(final_capital/1000 - 1)*100:.1f}%)")
 

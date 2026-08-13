@@ -32,6 +32,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# Exception: our hand-written spec IS source, keep it tracked
+!ai_xauusd_trading.spec
 
 # Installer logs
 pip-log.txt
@@ -145,11 +147,15 @@ models/
 *.onnx
 
 # Data files
-data/
+data/*
 *.csv
 *.json
 *.xlsx
 *.xls
+# Exceptions: the bundled offline fallback sample CSV and its doc ARE source
+# (negations must come AFTER the broad data/*.csv rules — last match wins)
+!data/xauusd_sample.csv
+!data/README.md
 
 # Logs
 logs/
@@ -159,9 +165,15 @@ performance_log.txt
 
 # Results and outputs
 results/
+output/
 outputs/
 plots/
 charts/
+
+# PyInstaller one-click build artifacts (build_exe.bat / build_exe.sh)
+AiXauusdTrading.exe
+*.exe
+*.spec.bak
 
 # API keys and secrets
 api_keys.txt

@@ -440,7 +440,11 @@ def plot_advanced_results(trader, price_data):
             exit_reasons = exits['reason'].unique()
             pnl_by_reason = [exits[exits['reason'] == reason]['pnl'] for reason in exit_reasons]
 
-            ax3.boxplot(pnl_by_reason, tick_labels=exit_reasons)
+            try:
+                ax3.boxplot(pnl_by_reason, tick_labels=exit_reasons)
+            except TypeError:
+                # matplotlib < 3.9 uses `labels`
+                ax3.boxplot(pnl_by_reason, labels=exit_reasons)
             ax3.set_title('P&L Distribution by Exit Reason')
             ax3.set_ylabel('P&L ($)')
             ax3.grid(True)

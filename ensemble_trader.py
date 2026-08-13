@@ -4,13 +4,26 @@ Ensemble Trading System
 Combines multiple RL models for better trading decisions
 """
 
-import pandas as pd
-import numpy as np
-from stable_baselines3 import PPO, TD3, SAC
-from stable_baselines3.common.vec_env import DummyVecEnv
-from trading_env import TradingEnv
 import os
+import warnings
+
+# Silence the upstream "Gym has been unmaintained..." DeprecationWarning triggered
+# by transitive SB3/compat imports; this project uses gymnasium everywhere.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Gym has been unmaintained.*",
+    category=DeprecationWarning,
+)
+os.environ.setdefault("GYM_NOTICE_DISABLE", "1")
+
 import json
+
+import numpy as np
+import pandas as pd
+from stable_baselines3 import PPO, SAC, TD3
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from trading_env import TradingEnv
 
 class EnsembleTrader:
     """
@@ -83,34 +96,80 @@ class EnsembleTrader:
 
         print("🎯 Ensemble training completed!")
 
+    # Mapping from filename prefix / algorithm string -> SB3 class
+    _ALGO_REGISTRY = {
+        'PPO': PPO, 'TD3': TD3, 'SAC': SAC,
+        'ppo': PPO, 'td3': TD3, 'sac': SAC,
+    }
+    # Zip files we recognise by naming convention `{name}_model.zip`
+    _KNOWN_NAMES = {'ppo': 'PPO', 'td3': 'TD3', 'sac': 'SAC'}
+
+    @classmethod
+    def _discover_models(cls, load_path: str):
+        """Scan `load_path` for `<name>_model.zip` files and build an ensemble config.
+
+        This lets the loader work out of the box on a fresh checkout without
+        requiring a pre-committed `ensemble_config.json` (which is blocked by
+        the project's `*.json` gitignore rule).
+        """
+        models = []
+        config = {}
+        for name, algo in cls._KNOWN_NAMES.items():
+            if os.path.exists(os.path.join(load_path, f'{name}_model.zip')):
+                models.append(name)
+                config[name] = {'algorithm': algo, 'policy': 'MlpPolicy', 'timesteps': 10000}
+        return {'models': models, 'weights': {n: 1.0 for n in models}, 'config': config}
+
     def load_ensemble(self, load_path='./ensemble_models/'):
-        """Load trained ensemble models"""
+        """Load trained ensemble models.
+
+        If ``ensemble_config.json`` is missing, auto-discovers any
+        ``<name>_model.zip`` files in ``load_path`` (ppo/td3/sac recognised).
+        """
         config_path = os.path.join(load_path, 'ensemble_config.json')
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            print(f"[ensemble] {config_path} not found - auto-discovering model zips...")
+            config = self._discover_models(load_path)
+            if not config['models']:
+                raise FileNotFoundError(
+                    f"No ensemble models found in {load_path!r}. "
+                    "Train them via `python train_model.py` or place "
+                    "`ppo_model.zip`/`td3_model.zip`/`sac_model.zip` there."
+                )
+            # Best-effort: write a config next to the zips so future loads are fast
+            try:
+                os.makedirs(load_path, exist_ok=True)
+                with open(config_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+                print(f"[ensemble] wrote {config_path}")
+            except OSError:
+                pass  # non-fatal (directory may be read-only)
 
         self.model_weights = config['weights']
 
         for model_name in config['models']:
             model_path = os.path.join(load_path, f'{model_name}_model.zip')
+            if not os.path.exists(model_path):
+                print(f"[ensemble] skipping {model_name}: {model_path} not found")
+                continue
 
-            # Get algorithm class from config
+            # Get algorithm class from config (tolerate lowercase keys)
             model_config = config['config'][model_name]
-            algorithm_name = model_config['algorithm']
-
-            if algorithm_name == 'PPO':
-                model_class = PPO
-            elif algorithm_name == 'TD3':
-                model_class = TD3
-            elif algorithm_name == 'SAC':
-                model_class = SAC
-            else:
+            algorithm_name = str(model_config['algorithm']).upper()
+            model_class = self._ALGO_REGISTRY.get(algorithm_name)
+            if model_class is None:
                 raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
             # Load model
             self.models[model_name] = model_class.load(model_path)
 
-        print(f"✅ Loaded ensemble with {len(self.models)} models")
+        if not self.models:
+            raise FileNotFoundError(f"No usable model zips could be loaded from {load_path!r}")
+
+        print(f"✅ Loaded ensemble with {len(self.models)} models ({', '.join(self.models)})")
 
     def predict_ensemble(self, observation, method='weighted_vote'):
         """Get ensemble prediction with confidence score"""

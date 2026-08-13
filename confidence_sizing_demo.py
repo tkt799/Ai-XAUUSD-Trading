@@ -4,12 +4,13 @@ Confidence-Based Position Sizing Demo
 Demonstrates how confidence scores affect position sizing for better entry/exit timing
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime, timedelta
 import random
+from datetime import datetime, timedelta
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 
 class ConfidenceBasedSizer:
     """

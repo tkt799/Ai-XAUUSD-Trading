@@ -4,11 +4,13 @@ Market Regime Detection System
 Identifies trending vs ranging markets and provides regime-adaptive trading parameters
 """
 
-import pandas as pd
-import numpy as np
-from enum import Enum
-from typing import Dict, List, Tuple, Optional
 import warnings
+from enum import Enum
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
 warnings.filterwarnings('ignore')
 
 class MarketRegime(Enum):
@@ -94,9 +96,11 @@ class MarketRegimeDetector:
     Advanced market regime detection using multiple indicators
     """
 
-    def __init__(self, lookback_periods: List[int] = [20, 50, 100]):
-        self.lookback_periods = lookback_periods
+    def __init__(self, lookback_periods: List[int] = None):
+        # NOTE: never use a mutable list as a default argument (Ruff B006)
+        self.lookback_periods = list(lookback_periods) if lookback_periods is not None else [20, 50, 100]
         self.regime_history = []
+        self._max_regime_history = 1000  # cap memory growth (called once per env step)
         self.parameters = RegimeParameters()
 
     def detect_regime(self, price_data: pd.DataFrame, current_idx: int = -1) -> Tuple[MarketRegime, Dict]:
@@ -129,7 +133,7 @@ class MarketRegimeDetector:
         # Get regime-specific parameters
         regime_params = self.parameters.get_parameters(regime)
 
-        # Store regime history
+        # Store regime history (capped — this runs once per environment step)
         self.regime_history.append({
             'timestamp': price_data.index[current_idx] if hasattr(price_data.index, '__getitem__') else current_idx,
             'regime': regime,
@@ -137,6 +141,8 @@ class MarketRegimeDetector:
             'volatility': volatility,
             'momentum': momentum
         })
+        if len(self.regime_history) > self._max_regime_history:
+            del self.regime_history[:-self._max_regime_history]
 
         return regime, regime_params
 
