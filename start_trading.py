@@ -23,8 +23,18 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Silence the noisy upstream 'gym is unmaintained' deprecation notice emitted by
+# some transitive SB3 compat imports.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Gym has been unmaintained.*",
+    category=DeprecationWarning,
+)
+os.environ.setdefault("GYM_NOTICE_DISABLE", "1")
 
 import numpy as np
 import pandas as pd

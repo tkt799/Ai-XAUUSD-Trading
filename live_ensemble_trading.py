@@ -5,8 +5,19 @@ Combines multiple RL models for real-time trading decisions
 """
 
 import logging
+import os
 import time
+import warnings
 from datetime import datetime, timedelta
+
+# Silence the upstream 'gym is unmaintained, switch to gymnasium' warning that
+# some transitive imports (SB3 compat shims) emit at startup.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Gym has been unmaintained.*",
+    category=DeprecationWarning,
+)
+os.environ.setdefault("GYM_NOTICE_DISABLE", "1")
 
 import numpy as np
 import pandas as pd

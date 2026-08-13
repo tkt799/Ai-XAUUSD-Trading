@@ -70,14 +70,16 @@ cd AI-XAUUSD-Trading
 pip install -r requirements.txt
 ```
 
-### Download Pre-trained Models
-```bash
-python download_models.py
-```
+> ℹ️ The repo already ships three trained model zips in `ensemble_models/`
+> (`ppo_model.zip`, `td3_model.zip`, `sac_model.zip`).
+> `EnsembleTrader.load_ensemble()` auto-discovers them if `ensemble_config.json`
+> is missing (the file is not committed because of a `*.json` gitignore rule),
+> so **no extra download step is required** to run.
 
-### Fetch Training Data (训练/回测前置步骤)
+### Fetch Training Data (训练/回测前置步骤，可选)
 ```bash
 python data_fetch.py    # 从 Yahoo Finance 下载 GC=F 日线 → xauusd_data.csv
+                        # (无网络时 start_trading.py 会自动回退到 data/xauusd_sample.csv)
 ```
 
 ### Run Tests
