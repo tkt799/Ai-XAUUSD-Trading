@@ -88,26 +88,43 @@ pytest tests/ -v
 
 ## 🚀 Quick Start
 
-### Run Backtesting Demo
+### 一键启动（推荐）
+
+```bash
+# 1. 安装依赖
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# 2. 一键 paper trading（离线回放，无需网络，30 秒内看到结果）
+python start_trading.py --paper --capital 1000 --leverage 50
+
+# 3. 一键 ensemble 回测（生成 equity 曲线 PNG）
+python start_trading.py --backtest --capital 1000
+
+# 4. 实时模式（需网络，拉 Yahoo Finance GC=F，仅模拟成交）
+python start_trading.py --live --capital 1000 --leverage 50
+
+# 5. 重新训练 ensemble（PPO+TD3+SAC）后再回放/回测
+python start_trading.py --retrain --timesteps 20000 --paper
+```
+
+`start_trading.py` 会自动：检查依赖 → 自动补全 `ensemble_config.json` → 优先复用
+`xauusd_data.csv`，失败时回退到 `data/xauusd_sample.csv`（无需网络）→ 运行所选模式。
+
+### 旧版 API（仍然可用）
+
+#### Run Backtesting Demo
 ```python
 from advanced_trading_demo import run_advanced_trading_demo
-
-# Run comprehensive backtest
 run_advanced_trading_demo()
 ```
 
-### Live Trading Setup
+#### Live Trading Setup
 ```python
 from live_ensemble_trading import LiveEnsembleTrader
 
-# Initialize live trader (ensemble defaults to ./ensemble_models/)
-trader = LiveEnsembleTrader(
-    capital=1000,
-    leverage=50,
-)
-
-# Start live trading loop (+Ctrl-C to stop and print the summary)
-trader.run_live_trading()
+trader = LiveEnsembleTrader(capital=1000, leverage=50)
+trader.run_live_trading()   # Ctrl-C 停止并打印绩效
 ```
 
 ### Market Regime Analysis

@@ -344,8 +344,18 @@ class LiveEnsembleTrader:
                         obs = self.get_observation(data)
                         action, confidence = self.ensemble.predict_ensemble(obs)
 
+                        # Normalise scalars (SB3 returns np.ndarray[shape=(1,)])
+                        if hasattr(action, '__len__'):
+                            action = float(action[0])
+                        else:
+                            action = float(action)
+                        if hasattr(confidence, '__len__'):
+                            confidence = float(confidence[0])
+                        else:
+                            confidence = float(confidence)
+
                         # Execute trade
-                        current_price = data.iloc[-1]['Close']
+                        current_price = float(data.iloc[-1]['Close'])
                         self.execute_trade(action, confidence, current_price)
 
                         # Log status

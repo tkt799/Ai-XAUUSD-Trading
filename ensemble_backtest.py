@@ -50,22 +50,38 @@ class EnsembleBacktester:
         # fixes the previous version which read non-existent 'rsi'/'macd' columns)
         test_df = add_technical_indicators(test_df)
 
-        position = 0
-        entry_price = 0
+        position = 0.0
+        entry_price = 0.0
         entry_time = None
-        stop_loss = 0
-        take_profit = 0
+        entry_step = None
+        stop_loss = 0.0
+        take_profit = 0.0
+
+        # Pre-compute a numeric step clock so max-holding-time works regardless
+        # of whether the DataFrame index is DatetimeIndex (live/real data) or
+        # integer RangeIndex (sample/offline replay).
+        index = test_df.index
+        is_datetime_index = isinstance(index, pd.DatetimeIndex)
 
         for i in range(20, len(test_df)):  # Start after indicator warmup
             current_data = test_df.iloc[:i+1]
-            current_price = test_df.iloc[i]['Close']
-            current_time = test_df.index[i]
+            current_price = float(test_df.iloc[i]['Close'])
+            current_time = index[i] if is_datetime_index else i
 
             # Create observation
             obs = self.create_observation(current_data, position, self.capital)
 
             # Get ensemble prediction
             action, confidence = self.ensemble.predict_ensemble(obs)
+            # Normalise to Python scalars — SB3 models return np.ndarray[shape=(1,)]
+            if hasattr(action, '__len__'):
+                action = float(action[0])
+            else:
+                action = float(action)
+            if hasattr(confidence, '__len__'):
+                confidence = float(confidence[0])
+            else:
+                confidence = float(confidence)
 
             # Execute trading logic
             if position == 0:  # No position
@@ -73,9 +89,10 @@ class EnsembleBacktester:
                     # Buy signal - size based on confidence
                     confidence_multiplier = confidence ** 0.5  # Square root scaling
                     position_size = self.capital * self.leverage * min(action, 1.0) * confidence_multiplier / current_price
-                    position = position_size
+                    position = float(position_size)
                     entry_price = current_price
                     entry_time = current_time
+                    entry_step = i
                     stop_loss = current_price * (1 - self.stop_loss_pct)
                     take_profit = current_price * (1 + self.take_profit_pct)
 
@@ -83,9 +100,10 @@ class EnsembleBacktester:
                     # Sell signal - size based on confidence
                     confidence_multiplier = confidence ** 0.5
                     position_size = self.capital * self.leverage * min(abs(action), 1.0) * confidence_multiplier / current_price
-                    position = -position_size  # Short position
+                    position = float(-position_size)  # Short position
                     entry_price = current_price
                     entry_time = current_time
+                    entry_step = i
                     stop_loss = current_price * (1 + self.stop_loss_pct)
                     take_profit = current_price * (1 - self.take_profit_pct)
 
@@ -109,8 +127,15 @@ class EnsembleBacktester:
                         should_exit = True
                         exit_reason = "Take Profit"
 
-                # Check max holding time
-                if entry_time and (current_time - entry_time).total_seconds() > self.max_holding_time * 3600:
+                # Check max holding time (bars or hours depending on index type)
+                holding_too_long = False
+                if entry_step is not None:
+                    if is_datetime_index and entry_time is not None:
+                        holding_too_long = (current_time - entry_time).total_seconds() > self.max_holding_time * 3600
+                    else:
+                        # Treat max_holding_time as "number of bars" when index is numeric
+                        holding_too_long = (i - entry_step) >= self.max_holding_time
+                if holding_too_long:
                     should_exit = True
                     exit_reason = "Max Time"
 
@@ -126,7 +151,7 @@ class EnsembleBacktester:
                         pnl = (current_price - entry_price) * position
                     else:  # Short position
                         pnl = (entry_price - current_price) * abs(position)
-                    self.capital += pnl
+                    self.capital += float(pnl)
 
                     # Record trade
                     trade = {
@@ -134,10 +159,14 @@ class EnsembleBacktester:
                         'exit_time': current_time,
                         'entry_price': entry_price,
                         'exit_price': current_price,
-                        'position': 'LONG' if position == 1 else 'SHORT',
-                        'pnl': pnl,
+                        'position': 'LONG' if position > 0 else 'SHORT',
+                        'pnl': float(pnl),
                         'exit_reason': exit_reason,
-                        'holding_time': (current_time - entry_time).total_seconds() / 3600  # hours
+                        'holding_time': (
+                            (current_time - entry_time).total_seconds() / 3600
+                            if is_datetime_index and entry_time is not None
+                            else (i - entry_step if entry_step is not None else 0)
+                        ),
                     }
                     self.trades.append(trade)
 
@@ -145,9 +174,10 @@ class EnsembleBacktester:
                     position = 0
                     entry_price = 0
                     entry_time = None
+                    entry_step = None
 
             # Record portfolio value
-            self.portfolio_values.append(self.capital)
+            self.portfolio_values.append(float(self.capital))
             self.timestamps.append(current_time)
 
         print("✅ Backtest completed!")
@@ -158,16 +188,26 @@ class EnsembleBacktester:
         lookback = 10
         current_idx = len(df) - 1
 
-        # Get last 10 closing prices
-        prices = df.iloc[current_idx - lookback + 1:current_idx + 1]['Close'].values
+        # Get last 10 closing prices; pad at the very start so length is always `lookback`.
+        if current_idx + 1 < lookback:
+            prices = np.pad(
+                df.iloc[:current_idx + 1]['Close'].values.astype(np.float32),
+                (lookback - (current_idx + 1), 0),
+                mode='edge',
+            )
+        else:
+            prices = df.iloc[current_idx - lookback + 1:current_idx + 1]['Close'].values.astype(np.float32)
 
         # Get current indicators (columns produced by add_technical_indicators)
         latest = df.iloc[current_idx]
-        rsi = latest['RSI']
-        macd = latest['MACD']
-        macd_signal = latest['MACD_signal']
+        rsi = float(latest['RSI'])
+        macd = float(latest['MACD'])
+        macd_signal = float(latest['MACD_signal'])
 
-        obs = np.concatenate([prices, [rsi, macd, macd_signal, position, balance]]).astype(np.float32)
+        obs = np.concatenate([
+            prices,
+            np.array([rsi, macd, macd_signal, float(position), float(balance)], dtype=np.float32),
+        ]).astype(np.float32)
 
         return obs.reshape(1, -1)
 
